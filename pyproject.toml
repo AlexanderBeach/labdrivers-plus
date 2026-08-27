@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "labdrivers-plus"
+version = "1.0.0"
+description = "Python drivers for laboratory instruments"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+keywords = [
+    "instrument",
+    "scpi",
+    "visa",
+    "gpib",
+    "measurement",
+    "cryogenics",
+    "oscilloscope",
+    "lock-in",
+    "sourcemeter",
+    "network analyzer",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+]
+
+# pyvisa reaches everything on GPIB, USB, serial or TCPIP, which is most of
+# the instruments here. The Oxford cryogenics controllers use a raw socket and
+# need nothing extra. The NI DAQ and Quantum Design drivers each need a
+# vendor library, so those are extras.
+dependencies = ["pyvisa>=1.11"]
+
+[project.optional-dependencies]
+ni = ["nidaqmx>=0.6"]
+quantumdesign = ["pythonnet>=3.0"]
+dev = ["pytest>=7", "black>=23", "pyflakes>=3"]
+
+[tool.setuptools.packages.find]
+include = ["labdrivers*"]
+
+# The Quantum Design and rotation probe drivers load a vendor library at
+# runtime and look for it beside their own module, so it has to travel with
+# the package.
+[tool.setuptools.package-data]
+"labdrivers.quantumdesign" = ["*.dll"]
+"labdrivers.funky_rotator" = ["*.dll"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,186 +1,271 @@
-import logging
+"""Driver for Quantum Design cryostats through the QDInstrument .NET assembly.
 
-import clr
-clr.AddReference('System')
-#from clr import System
-from System import Reflection
+Covers the PPMS, DynaCool, VersaLab, SVSM and MPMS 3 by way of Quantum Design's
+``QDInstrument.dll``, which talks to MultiVu. Reaching it from Python needs
+pythonnet, and MultiVu must be running on the machine that owns the instrument.
+
+The assembly is located when an instrument is constructed, either from an
+explicit path or from alongside this module, so importing labdrivers on a
+machine without pythonnet or the DLL costs nothing.
+"""
+
+import logging
+import os
+import time
+
+from ..core import check_choice, check_range
+from ..core.errors import ConnectionFailure, InstrumentTimeoutError
 
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.StreamHandler())
 
-# load the C# .dll supplied by Quantum Design
-#full_filename = r'C:\ProgramData\Anaconda3\Lib\site-packages\labdrivers\QDInstrument.dll'
-#Reflection.Assembly.LoadFile(full_filename)
-clr.AddReference('C:\ProgramData\Miniconda3\Lib\site-packages\labdrivers\quantumdesign\QDInstrument.dll')
+# The DLL ships alongside this module.
+DEFAULT_DLL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "QDInstrument.dll"
+)
 
-if clr.FindAssembly('C:\ProgramData\Anaconda3\Lib\site-packages\labdrivers\QDInstrument.dll') is None:
-    logger.exception('\n\tCould not find QDInstrument.dll')
-else:
-    logger.exception('\n\tFound QDInstrument.dll at {}'.format(clr.FindAssembly('QDInstrument')))
-    logger.exception('\n\tTry right-clicking the .dll, selecting "Properties", and then clicking "Unblock"')
+# Instrument types as QDInstrumentBase.QDInstrumentType numbers them.
+INSTRUMENT_TYPES = {
+    "ppms": 0,
+    "versalab": 1,
+    "dynacool": 2,
+    "svsm": 3,
+    "mpms3": 4,
+}
 
-# import the C# classes for interfacing with the PPMS
-from QuantumDesign.QDInstrument import QDInstrumentBase, QDInstrumentFactory
+# Temperature approach modes.
+TEMPERATURE_APPROACHES = {"fast settle": 0, "no overshoot": 1}
 
-QDINSTRUMENT_TYPE = {'DynaCool': QDInstrumentBase.QDInstrumentType.DynaCool,
-                     'PPMS': QDInstrumentBase.QDInstrumentType.PPMS,
-                     'SVSM': QDInstrumentBase.QDInstrumentType.SVSM,
-                     'VersaLab': QDInstrumentBase.QDInstrumentType.VersaLab,
-                     'MPMS': 4121982}
-DEFAULT_PORT = 11000
+# Field approach modes and end states.
+FIELD_APPROACHES = {"linear": 0, "no overshoot": 1, "oscillate": 2}
+FIELD_END_STATES = {"persistent": 0, "driven": 1}
+
+# Position approach modes.
+POSITION_APPROACHES = {"move to position": 0, "move to index": 1, "redefine": 2}
 
 
 class QdInstrument:
-    """A class to interface with Quantum Design instruments.
+    """Base for Quantum Design instruments reached through MultiVu.
 
-    This class is a thin wrapper around the C# QuantumDesign.QDInstrument.QDInstrumentBase class
-    provided in the QDInstrument.dll file.
-
-    There is now support for using a Quantum Design DynaCool, PPMS, SVSM, and VersaLab. The MPMS
-    class requires testing, but should work. For some reason, the MPMS enum was hard-coded in
-    as the number 4121982 casted as a QDInstrumentBase.QDInstrumentType enum.
+    :param instrument_type: Which instrument, e.g. 'dynacool'.
+    :param ip_address: Address of the machine running MultiVu. Use '127.0.0.1'
+                       when running on that machine itself.
+    :param remote: Whether to talk to MultiVu over the network rather than
+                   in-process.
+    :param dll_path: Location of QDInstrument.dll (default: alongside this
+                     module).
     """
 
-    def __init__(self, instrument_type, ip_address, remote=True):
-        self.qdi_instrument = QDInstrumentFactory.GetQDInstrument(
-            QDINSTRUMENT_TYPE[instrument_type], remote, ip_address, DEFAULT_PORT)
+    def __init__(
+        self, instrument_type, ip_address="127.0.0.1", remote=True, dll_path=None
+    ):
+        code = check_choice(instrument_type, INSTRUMENT_TYPES, "instrument type")
+        self.instrument_type = str(instrument_type).lower()
+        self.ip_address = str(ip_address)
+        self.dll_path = DEFAULT_DLL_PATH if dll_path is None else str(dll_path)
 
-    def getTemperature(self):
-        """Returns the instrument temperature in Kelvin.
+        factory = self._load_assembly()
+        self._instrument = factory.GetQDInstrument(code, bool(remote), self.ip_address)
 
-        Parameters are from:
-        SetTemperature(double Temperature, double Rate, QDInstrumentBase.TemperatureApproach Approach)
+    def _load_assembly(self):
+        """Load QDInstrument.dll and return the instrument factory."""
+        try:
+            import clr
+        except ImportError:
+            raise ConnectionFailure(
+                "pythonnet is not installed, so the Quantum Design .NET "
+                "assembly cannot be loaded. Install it with "
+                "'pip install pythonnet'."
+            )
+
+        if not os.path.isfile(self.dll_path):
+            raise ConnectionFailure(
+                f"Could not find QDInstrument.dll at '{self.dll_path}'. It ships "
+                "with MultiVu. Pass its location as dll_path, or copy it next "
+                "to this module."
+            )
+
+        try:
+            clr.AddReference(self.dll_path)
+            from QuantumDesign.QDInstrument import QDInstrumentFactory
+        except Exception as err:
+            raise ConnectionFailure(
+                f"Could not load '{self.dll_path}'. If the file came from a "
+                "download, Windows may have blocked it: right-click it, choose "
+                "Properties, and click Unblock. The assembly is also 32-bit, so "
+                "a 32-bit Python may be required. Original error: "
+                f"{err}"
+            )
+        return QDInstrumentFactory
+
+    # Temperature
+
+    @property
+    def temperature(self):
+        """Returns the present sample temperature, in kelvin."""
+        return self._instrument.GetTemperature(0.0, 0)[1]
+
+    @property
+    def temperature_status(self):
+        """Returns the status code describing what the temperature control is doing."""
+        return self._instrument.GetTemperature(0.0, 0)[2]
+
+    def set_temperature(self, temperature, rate=10.0, approach="fast settle"):
+        """Set the temperature setpoint.
+
+        :param temperature: Target temperature, in kelvin.
+        :param rate: Ramp rate, in kelvin per minute.
+        :param approach: 'fast settle' or 'no overshoot'.
         """
-        return self.qdi_instrument.GetTemperature(0, 0)
+        check_range(temperature, 0, 1000, "temperature setpoint", " K")
+        check_range(rate, 0, 100, "temperature ramp rate", " K/min")
+        code = check_choice(approach, TEMPERATURE_APPROACHES, "temperature approach")
+        return self._instrument.SetTemperature(float(temperature), float(rate), code)
 
-    def setTemperature(self, temp, rate=10):
-        """Ramps the instrument temperature to the set point.
+    def wait_for_temperature(self, delay=5.0, timeout=600.0):
+        """Block until the temperature is stable.
 
-        Parameters are from:
-        GetTemperature(ref double Temperature, ref QDInstrumentBase.TemperatureStatus Status)
-
-        :param temp: Desired temperature in Kelvin
-        :param rate: Temperature ramp rate in Kelvin/min.
-        :return: None
+        :param delay: Seconds between checks.
+        :param timeout: Seconds to wait before giving up.
+        :raises InstrumentTimeoutError: If it never stabilises.
         """
-        if 0 <= temp <= 400:
-            return self.qdi_instrument.SetTemperature(temp, rate, 0)
-        else:
-            raise RuntimeError("Temperature is out of bounds. Should be between 0 and 400 K")
+        return self._wait(
+            lambda: self.temperature_status == 1,
+            delay,
+            timeout,
+            "the temperature to stabilise",
+        )
 
-    def waitForTemperature(self, delay=5, timeout=600):
+    # Field
+
+    @property
+    def field(self):
+        """Returns the present magnetic field, in oersted."""
+        return self._instrument.GetField(0.0, 0)[1]
+
+    @property
+    def field_status(self):
+        """Returns the status code describing what the magnet is doing."""
+        return self._instrument.GetField(0.0, 0)[2]
+
+    def set_field(self, field, rate=200.0, approach="linear", end_state="driven"):
+        """Set the magnetic field.
+
+        :param field: Target field, in oersted.
+        :param rate: Ramp rate, in oersted per second.
+        :param approach: 'linear', 'no overshoot' or 'oscillate'.
+        :param end_state: 'driven' or 'persistent'.
         """
-        Prevents other processes from executing while the QD instrument temperature
-        is settling down.
+        check_range(field, -1e5, 1e5, "field setpoint", " Oe")
+        check_range(rate, 0, 1e4, "field ramp rate", " Oe/s")
+        approach_code = check_choice(approach, FIELD_APPROACHES, "field approach")
+        end_code = check_choice(end_state, FIELD_END_STATES, "field end state")
+        return self._instrument.SetField(
+            float(field), float(rate), approach_code, end_code
+        )
 
-        :param delay: Length of time to wait after wait condition achieved in seconds.
-        :param timeout: Length of time to wait to achieve wait condition in seconds.
-        :return: 0 when complete.
+    def wait_for_field(self, delay=5.0, timeout=600.0):
+        """Block until the field is stable."""
+        return self._wait(
+            lambda: self.field_status == 1, delay, timeout, "the field to stabilise"
+        )
+
+    # Position
+
+    @property
+    def position(self):
+        """Returns the present sample position, in degrees or millimetres."""
+        return self._instrument.GetPosition("Horizontal Rotator", 0.0, 0)[1]
+
+    @property
+    def position_status(self):
+        """Returns the status code describing what the sample stage is doing."""
+        return self._instrument.GetPosition("Horizontal Rotator", 0.0, 0)[2]
+
+    def set_position(self, position, rate=10.0, approach="move to position"):
+        """Move the sample stage.
+
+        :param position: Target position.
+        :param rate: Speed of the move.
+        :param approach: 'move to position', 'move to index' or 'redefine'.
         """
-        return self.qdi_instrument.WaitFor(True, False, False, False, delay, timeout)
+        code = check_choice(approach, POSITION_APPROACHES, "position approach")
+        return self._instrument.SetPosition(
+            "Horizontal Rotator", float(position), float(rate), code
+        )
 
-    def getField(self):
-        """Returns the Magnetic field in Gauss.
+    def wait_for_position(self, delay=5.0, timeout=600.0):
+        """Block until the sample stage stops moving."""
+        return self._wait(
+            lambda: self.position_status == 1,
+            delay,
+            timeout,
+            "the sample stage to stop",
+        )
 
-        Parameters are from:
-        GetField(ref double Field, ref QDInstrumentBase.FieldStatus Status)
+    # Raw commands
 
-        :return: Field in Gauss.
+    def send_ppms_command(self, command, argument1=0.0, argument2=0.0):
+        """Send an arbitrary Model 6000 command. PPMS only.
+
+        This is the escape hatch for anything the .NET interface does not
+        expose, including the rotator.
         """
-        return self.qdi_instrument.GetField(0, 0)
+        if self.instrument_type != "ppms":
+            raise ConnectionFailure(
+                "Raw Model 6000 commands are only available on a PPMS. This is "
+                f"a {self.instrument_type}."
+            )
+        return self._instrument.SendPPMSCommand(
+            command, "", "", int(argument1), int(argument2)
+        )
 
-    def setField(self, field, rate=200):
-        """Ramps the instrument magnetic field to the set point.
+    def _wait(self, condition, delay, timeout, description):
+        check_range(delay, 0, 3600, "check interval", " s")
+        check_range(timeout, 0, 86400, "timeout", " s")
+        deadline = time.monotonic() + float(timeout)
+        while not condition():
+            if time.monotonic() > deadline:
+                raise InstrumentTimeoutError(
+                    f"Timed out after {timeout} s waiting for {description} on "
+                    f"the {self.instrument_type}."
+                )
+            time.sleep(float(delay))
+        return True
 
-        Parameters are from:
-        SetField(double Field, double Rate, QDInstrumentBase.FieldApproach Approach, QDInstrumentBase.FieldMode Mode)
-
-        :param field: Set point of the applied magnetic field in Gauss.
-        :param rate:  Ramp rate of the applied magnetic field in Gauss/sec.
-        :return: None
-        """
-        self.qdi_instrument.SetField(field, rate, 0, 0)
-
-    def waitForField(self, delay=5, timeout=600):
-        """
-        Prevents other processes from executing while the QD instrument magnetic field
-        is settling down.
-
-        :param delay: Length of time to wait after wait condition achieved in seconds.
-        :param timeout: Length of time to wait to achieve wait condition in seconds.
-        :return: 0 when complete.
-        """
-        return self.qdi_instrument.WaitFor(False, True, False, False, delay, timeout)
-
-    def getPosition(self):
-        """Retrieves the position of the rotator.
-
-        GetPosition(string Axis, ref double Position, ref QDInstrumentBase.PositionStatus Status)
-
-        "Horizontal Rotator" seems to be the name that one should pass to GetPosition, as
-        observed in the WaitConditionReached function.
-        """
-        return self.qdi_instrument.GetPosition("Horizontal Rotator", 0, 0)
-        #return self.qdi_instrument.GetPPMSItem(3,0,True)
-
-    def setPosition(self, position):
-        """Ramps the instrument position to the set point.
-
-        Parameters are from:
-        SetPosition(string Axis, double Position, double Speed, QDInstrumentBase.PositionMode Mode)
-
-        :param position: Position on the rotator to move to.
-        :param speed: Rate of change of position on the rotator. Set at 0.8deg/sec
-        """
-        return self.qdi_instrument.SetPosition("Horizontal Rotator", position, 0.8, 0)
-#        cmd = 'MOVE ' + str("{:e}".format(position)) + ' 0 14'
-#        return self.qdi_instrument.SendPPMSCommand(cmd, '', '',0,0)[0]
-    
-    def sendPpmsCommand(self, i0, i1, i2, i3, i4):
-        cmd = 'MOVE ' + str("{:e}".format(i0)) + ' 0 14'
-        return self.qdi_instrument.SendPPMSCommand(cmd, i1, i2,i3,i4)
-
-    def waitForPosition(self, delay, timeout):
-        """
-        Prevents other processes from executing while the QD instrument rotator position
-        is settling down.
-
-        :param delay: Length of time to wait after wait condition achieved in seconds.
-        :param timeout: Length of time to wait to achieve wait condition in seconds.
-        :return: 0 when complete.
-        """
-        return self.qdi_instrument.WaitFor(False, False, True, False, delay, timeout)
-        
-   # def sendPpmsCommand(self, string PpmsCommand, string PpmsReply, string ErrorReply, int Device, double timeout):
-   #     return self. qdi_instrument.SnedPpmsCommand
-    
-
-
-class Dynacool(QdInstrument):
-    """QdInstrument subclass that connects to the Quantum Design PPMS DynaCool."""
-    def __init__(self, ip_address):
-        super().__init__(instrument_type='DynaCool', ip_address=ip_address)
+    def __repr__(self):
+        return f"{type(self).__name__}({self.ip_address!r})"
 
 
 class Ppms(QdInstrument):
-    """QdInstrument subclass that connects to the Quantum Design PPMS."""
-    def __init__(self, ip_address):
-        super().__init__(instrument_type='PPMS', ip_address=ip_address)
+    """A Quantum Design PPMS."""
 
-
-class Svsm(QdInstrument):
-    """QdInstrument subclass that connects to the Quantum Design SVSM."""
-    def __init__(self, ip_address):
-        super().__init__(instrument_type='SVSM', ip_address=ip_address)
+    def __init__(self, ip_address="127.0.0.1", **kwargs):
+        super().__init__("ppms", ip_address, **kwargs)
 
 
 class VersaLab(QdInstrument):
-    """QdInstrument subclass that connects to the Quantum Design VersaLab."""
-    def __init__(self, ip_address):
-        super().__init__(instrument_type='VersaLab', ip_address=ip_address)
+    """A Quantum Design VersaLab."""
+
+    def __init__(self, ip_address="127.0.0.1", **kwargs):
+        super().__init__("versalab", ip_address, **kwargs)
+
+
+class Dynacool(QdInstrument):
+    """A Quantum Design PPMS DynaCool."""
+
+    def __init__(self, ip_address="127.0.0.1", **kwargs):
+        super().__init__("dynacool", ip_address, **kwargs)
+
+
+class Svsm(QdInstrument):
+    """A Quantum Design SVSM."""
+
+    def __init__(self, ip_address="127.0.0.1", **kwargs):
+        super().__init__("svsm", ip_address, **kwargs)
 
 
 class Mpms(QdInstrument):
-    """QdInstrument subclass that connects to the Quantum Design MPMS."""
-    def __init__(self, ip_address):
-        super().__init__(instrument_type='MPMS', ip_address=ip_address)
+    """A Quantum Design MPMS 3."""
+
+    def __init__(self, ip_address="127.0.0.1", **kwargs):
+        super().__init__("mpms3", ip_address, **kwargs)

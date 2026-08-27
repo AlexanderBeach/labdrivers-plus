@@ -1,270 +1,168 @@
-import socket
+"""Driver for the Mercury iTC as fitted to an Oxford HelioxVT insert.
+
+A Heliox is a single-shot helium-3 refrigerator. Its iTC controls a different
+set of stages from a plain VTI system, namely the sorb, the He-3 pot and the
+1 K plate. Running it also involves a condense-and-recirculate cycle that has
+no equivalent on a standard cryostat.
+
+The sensor map differs from a plain VTI system, and the sorb has a temperature
+limit that must not be exceeded, so the two are separate drivers.
+
+Commands are transcribed from the *HelioxVT Manual* (issue 5) and the
+*Mercury iTC Operator's Manual* (issue 18).
+"""
+
 import time
 
-import numpy as np
-import pyvisa as visa
+from ..core import check_range
+from ..core.errors import InstrumentTimeoutError
+from .mercuryitc import MercuryItc
+
+# Board identifiers for a HelioxVT fit. Override with sensors= if yours differs.
+HELIOX_SENSORS = {
+    "sorb": "DB6.T1",
+    "he3pot": "DB7.T1",
+    "he3pot_low": "DB7.T1",
+    "onek": "MB1.T1",
+}
+
+# The sorb heater is used to drive helium off the charcoal during condensing.
+# Going far above this risks the sorb heater, so the driver refuses to.
+MAXIMUM_SORB_TEMPERATURE = 50.0
+
+# Typical condensing and base-temperature setpoints, in kelvin.
+DEFAULT_CONDENSE_TEMPERATURE = 30.0
+DEFAULT_SORB_BASE_TEMPERATURE = 4.0
 
 
-class mercuryitc_heliox:
+class MercuryItcHeliox(MercuryItc):
+    """Interface to the Mercury iTC in an Oxford HelioxVT insert.
+
+        heliox = MercuryItcHeliox(ip_address="192.168.0.11")
+        heliox.condense()
+        heliox.wait_for_temperature("he3pot", 0.3)
+
+    :param maximum_sorb_temperature: Highest the sorb may be driven to, in
+                                     kelvin.
+    """
+
     def __init__(
         self,
-        mode="visa",
-        resource_name=None,
-        ip_address=None,
-        port=7020,
-        timeout=10.0,
-        bytes_to_read=1024,
-        baudrate=9600,
+        *args,
+        maximum_sorb_temperature=MAXIMUM_SORB_TEMPERATURE,
+        sensors=None,
+        **kwargs,
     ):
-        """
-        Parameters:
-        :param str mode: The connection to the iPS, either 'ip' or 'visa'
-        :param str resource_name: VISA resource name of the Mercury iPS
-        :param str ip_address: IP address of the Mercury iPS
-        :param port: Port number of the Mercury iPS
-        :type port: integer
-        :param timeout: Time in seconds to wait for command acknowledgment
-        :type timeout: float
-        :param bytes_to_read: Number of bytes to read from query
-        :type bytes_to_read: integer
-        """
-        self.mode = mode
-        self.resource_name = resource_name
-        self.resource_manager = visa.ResourceManager()
-        self.ip_address = ip_address
-        self.port = port
-        self.timeout = timeout
-        self.bytes_to_read = bytes_to_read
-        self.baudrate = baudrate
-        supported_modes = ("ip", "visa")
-        self.instr = self.resource_manager.open_resource(self.resource_name)
+        merged = dict(HELIOX_SENSORS)
+        if sensors:
+            merged.update(
+                {str(name).lower(): str(uid) for name, uid in sensors.items()}
+            )
+        super().__init__(*args, sensors=merged, **kwargs)
+        self.maximum_sorb_temperature = float(maximum_sorb_temperature)
 
-        self.temp_sensor = {"probe_low": "DB8.T1", "VTI": "MB1.T1", "He3Pot": "DB7.T1"}
+    # Stage temperatures
 
-        if mode.lower().strip() in supported_modes:
-            self.mode = mode
-        else:
-            raise RuntimeError("Mode is not currently supported.")
+    @property
+    def sorb_temperature(self):
+        """Returns the sorb temperature, in kelvin."""
+        return self.temperature("sorb")
 
-        if mode == "visa":
-            self.instr.baud_rate = self.baudrate
+    @property
+    def he3_pot_temperature(self):
+        """Returns the helium-3 pot temperature, in kelvin. This is the sample stage."""
+        return self.temperature("he3pot")
 
-    def query_ip(self, command):
-        """Sends a query to the MercuryIPS via ethernet.
-        :param command: The command, which should be in the NOUN + VERB format
-        :type command: string
-        :returns str: The MercuryItc response
-        """
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((self.ip_address, self.port))
-            s.settimeout(self.timeout)
-            s.sendall(command.encode())
-            response = s.recv(self.bytes_to_read).decode()
+    @property
+    def one_kelvin_plate_temperature(self):
+        """Returns the 1 K plate temperature, in kelvin."""
+        return self.temperature("onek")
 
-        return response.decode()
+    # Sorb control
 
-    def query_visa(self, command):
-        """Sends a query to the MercuryIPS via VISA.
-        :param command: The command, which should be in the VERB + NOUN format
-        :type command: string
-                :returns str: The MercuryIPS response
-        """
-        instr = self.resource_manager.open_resource(self.resource_name)
-        response = instr.query(command)
-        instr.close()
-
-        return response
-
-    @staticmethod
-    def extract_value(response, noun, unit):
-        """Finds the value that is contained within the response to a previously sent query.
-
-        :param response: The response from a query.
-                :type response: string
-                :param noun: The part of the query that refers to the NOUN (refer to MercuryIPS documentation).
-                :param unit: The measurement unit (e.g. K for Kelvin, T for Tesla).
-                :returns float: The value of the response, but without units.
-        """
-        expected_response = "STAT:" + noun + ":"
-        value = float(
-            response.replace(expected_response, "").strip("\n").replace(unit, "")
+    def set_sorb_temperature(self, value):
+        """Set the sorb setpoint, refusing anything that could damage it."""
+        check_range(
+            value,
+            0,
+            self.maximum_sorb_temperature,
+            "sorb temperature setpoint",
+            " K",
         )
-        return value
+        return self.setpoint("sorb", value)
 
-    # Employing hash tables instead of if-else trees
-    QUERY_AND_RECEIVE = {"ip": query_ip, "visa": query_visa}
+    # Condensing cycle
+    #
+    # A single-shot He-3 cycle is: heat the sorb so it releases the helium,
+    # which condenses in the pot. Then cool the sorb so it pumps on the pot,
+    # taking it to base temperature. The charge lasts until the pot runs dry,
+    # at which point the cycle is repeated.
 
-    def temp(self, sensor):
-        """Reads temperature of the temperature sensor.
-        :param temp_sensor: Probe(DB8.T1) or VTI(MB0.T1)
+    def condense(
+        self, sorb_temperature=DEFAULT_CONDENSE_TEMPERATURE, wait=True, timeout=3600.0
+    ):
+        """Drive the sorb warm so the helium-3 condenses into the pot.
+
+        :param sorb_temperature: Temperature to hold the sorb at, in kelvin.
+        :param wait: Block until the sorb reaches that temperature.
         """
-        dev = self.temp_sensor[sensor]
-        noun = "DEV:" + dev + ":TEMP:SIG:TEMP"
-        command = "READ:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        return self.extract_value(response, noun, "K")
+        self.set_sorb_temperature(sorb_temperature)
+        self.heater_enabled("sorb", True)
+        if wait:
+            self.wait_for_temperature("sorb", sorb_temperature, timeout=timeout)
+        return self.sorb_temperature
 
-    def autoPID(self, sensor, value):
-        dev = self.temp_sensor[sensor]
-        noun = "DEV:" + dev + ":TEMP:LOOP:ENAB:" + str(value).upper()
-        command = "SET:" + noun
-        if value.upper() == "ON" or value.upper() == "OFF":
-            response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        else:
-            return 'The argument must be either "on" or "off"'
+    def recirculate(
+        self, sorb_temperature=DEFAULT_SORB_BASE_TEMPERATURE, wait=True, timeout=3600.0
+    ):
+        """Cool the sorb so it pumps on the pot and takes it to base.
 
-    def autoFlow(self, sensor, value):
-        dev = self.temp_sensor[sensor]
-        noun = "DEV:" + dev + ":TEMP:LOOP:FAUT:" + str(value).upper()
-        command = "SET:" + noun
-        if value.upper() == "ON" or value.upper() == "OFF":
-            response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        else:
-            return 'The argument must be either "on" or "off"'
+        :param sorb_temperature: Temperature to hold the sorb at, in kelvin.
+        :param wait: Block until the sorb reaches that temperature.
+        """
+        self.set_sorb_temperature(sorb_temperature)
+        if wait:
+            self.wait_for_temperature("sorb", sorb_temperature, timeout=timeout)
+        return self.sorb_temperature
 
-    def rampmode(self, sensor, value):
-        dev = self.temp_sensor[sensor]
-        noun = "DEV:" + dev + ":TEMP:LOOP:RENA:" + str(value).upper()
-        command = "SET:" + noun
-        if value.upper() == "ON" or value.upper() == "OFF":
-            response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        else:
-            return 'The argument must be either "on" or "off"'
+    def run_cycle(
+        self,
+        condense_temperature=DEFAULT_CONDENSE_TEMPERATURE,
+        base_temperature=DEFAULT_SORB_BASE_TEMPERATURE,
+        soak=600.0,
+        timeout=3600.0,
+    ):
+        """Run a full condense-and-recirculate cycle.
 
-    @property
-    def ramprate(self):
-        noun = "DEV:DB8.T1:TEMP:LOOP:RSET"
-        command = "READ:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        return self.extract_value(response, noun, "K/m")
+        :param condense_temperature: Sorb temperature during condensing.
+        :param base_temperature: Sorb temperature during recirculation.
+        :param soak: Seconds to hold the sorb warm before cooling it, which is
+                     what determines how much helium is condensed and so how
+                     long the charge lasts.
+        :return: The helium-3 pot temperature at the end.
+        """
+        self.condense(condense_temperature, wait=True, timeout=timeout)
+        time.sleep(float(soak))
+        self.recirculate(base_temperature, wait=True, timeout=timeout)
+        return self.he3_pot_temperature
 
-    @ramprate.setter
-    def ramprate(self, value):
-        noun = "DEV:DB8.T1:TEMP:LOOP:RSET:" + str(value)
-        command = "SET:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
+    def wait_for_base(self, target=0.35, timeout=7200.0, interval=10.0):
+        """Block until the helium-3 pot reaches base temperature.
 
-    @property
-    def VTI_temp_setpoint(self):
-        dev = self.temp_sensor["VTI"]
-        noun = "DEV:" + dev + ":TEMP:LOOP:TSET"
-        command = "READ:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        return self.extract_value(response, noun, "K")
+        :param target: Temperature to wait for, in kelvin.
+        :raises InstrumentTimeoutError: If it never gets there, which usually
+                                        means the charge did not condense.
+        """
+        deadline = time.monotonic() + float(timeout)
+        while self.he3_pot_temperature > float(target):
+            if time.monotonic() > deadline:
+                raise InstrumentTimeoutError(
+                    f"The helium-3 pot did not reach {target} K within {timeout} s. "
+                    f"It last read {self.he3_pot_temperature} K. The charge "
+                    "may not have condensed."
+                )
+            time.sleep(interval)
+        return self.he3_pot_temperature
 
-    @VTI_temp_setpoint.setter
-    def VTI_temp_setpoint(self, value):
-        dev = self.temp_sensor["VTI"]
-        noun = "DEV:" + dev + ":TEMP:LOOP:TSET:" + str(value)
-        command = "SET:" + noun
-        if 0 <= value <= 300:
-            response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        else:
-            return "Temperature range must be between 0 and 300 K"
-
-    @property
-    def probe_temp_setpoint(self):
-        dev = self.temp_sensor["probe"]
-        noun = "DEV:" + dev + ":TEMP:LOOP:TSET"
-        command = "READ:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        return self.extract_value(response, noun, "K")
-
-    @probe_temp_setpoint.setter
-    def probe_temp_setpoint(self, value):
-        dev = self.temp_sensor["probe"]
-        noun = "DEV:" + dev + ":TEMP:LOOP:TSET:" + str(value)
-        command = "SET:" + noun
-        if 0 <= value <= 300:
-            response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        else:
-            return "Temperature range must be between 0 and 300 K"
-
-    @property
-    def probe_temp_ramprate(self):
-        dev = self.temp_sensor["probe"]
-        noun = "DEV:" + dev + ":TEMP:LOOP:RSET"
-        command = "READ:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        return self.extract_value(response, noun, "K/m")
-
-    @probe_temp_ramprate.setter
-    def probe_temp_ramprate(self, sensor, value):
-        dev = self.temp_sensor["probe"]
-        noun = "DEV:" + dev + ":TEMP:LOOP:RSET:" + str(value)
-        command = "SET:" + noun
-        if 0 <= value:
-            response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        else:
-            return "Ramp rate has to be a positive number"
-
-    @property
-    def pressure(self):
-        noun = "DEV:DB5.P1:PRES:LOOP:PRST"
-        command = "READ:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        return self.extract_value(response, noun, "mB")
-
-    @pressure.setter
-    def pressure(self, value):
-        noun = "DEV:DB5.P1:PRES:LOOP:PRST:" + str(value)
-        command = "SET:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-
-    def pressure_now(self):
-        noun = "DEV:DB5.P1:PRES:SIG:PRES"
-        command = "READ:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        return self.extract_value(response, noun, "mB")
-
-    @property
-    def pressure_auto_flow(self):
-        noun = "DEV:DB5.P1:PRES:LOOP:FAUT"
-        command = "READ:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        return response.replace("STAT:DEV:DB5.P1:PRES:LOOP:FAUT:", "").replace("\n", "")
-
-    @pressure_auto_flow.setter
-    def pressure_auto_flow(self, input):
-        noun = "DEV:DB5.P1:PRES:LOOP:FAUT:"
-        command = "SET:" + noun + input
-        if input in ["OFF", "ON"]:
-            response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        else:
-            raise RuntimeError("Pressure autoflow can be either 'ON' or 'OFF'.")
-
-    @property
-    def pressure_flow(self):
-        noun = "DEV:DB5.P1:PRES:LOOP:FSET"
-        command = "READ:" + noun
-        response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-        return float(
-            response.replace("STAT:DEV:DB5.P1:PRES:LOOP:FSET:", "").replace("\n", "")
-        )
-
-    @pressure_flow.setter
-    def pressure_flow(self, input):
-        noun = "DEV:DB5.P1:PRES:LOOP:FSET:"
-        command = "SET:" + noun + str(input)
-        if 0 <= input <= 100:
-            if self.pressure_auto_flow == "OFF":
-                response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-            else:
-                self.pressure_auto_flow = "OFF"
-                response = MercuryItc.QUERY_AND_RECEIVE[self.mode](self, command)
-                print("Pressure auto flow has been turned 'OFF'.")
-        else:
-            raise RuntimeError("Manual flow percentage can be between 0 and 100.")
-
-    def wait_for_temp(self, sensor, value):
-        dev = self.temp_sensor[sensor]
-        there_yet = False
-        T_avg = []
-        while not there_yet:
-            T_avg.append(self.temp(sensor))
-            time.sleep(0.2)
-            if (
-                abs(np.average(T_avg[-50:]) - value) < value * 2e-4
-                and np.var(T_avg[-50:]) < value * 1e-5
-            ):
-                there_yet = True
+    def __repr__(self):
+        return f"MercuryItcHeliox({self._transport!r})"

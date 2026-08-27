@@ -1,6 +1,7 @@
-The MIT License (MIT)
+MIT License
 
-Copyright (c) 2016 Mason Group, The University of Illinois at Urbana-Champaign
+Copyright (c) 2016-2018 Henry Hinnefeld and the labdrivers contributors
+Copyright (c) 2018-2026 Alexander Beach
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -17,4 +18,13 @@ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+All trademarks referenced herein are the property of their respective holders.
+
+This software includes two vendor libraries that it loads at runtime:
+QDInstrument.dll, from Quantum Design, and WJ_API.dll, from Fangcun Keyi. They
+remain the property of their respective vendors, are distributed here only so
+that the drivers which depend on them work out of the box, and are not covered
+by the MIT license above.

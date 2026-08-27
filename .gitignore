@@ -1,20 +1,8 @@
-*.pyc
-*.un~
-*.py~
-*~
-*.swp
-*_build/*
-ALTERNATIVES
-
-venv/
-.vs/
-.vscode/
-.ipynb_checkpoints/
-example_nbs/.ipynb_checkpoints/
-
+__pycache__/
+*.py[cod]
+*.egg-info/
 build/
 dist/
-*.egg-info
+.venv/
+venv/
 
-.idea/
-.idea*

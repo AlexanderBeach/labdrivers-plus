@@ -1,613 +1,781 @@
-import logging
+"""Driver for the Stanford Research Systems SR830 DSP lock-in amplifier.
+
+The SR830 can be reached over GPIB or RS-232. Which one is a constructor
+argument::
+
+    Sr830(gpib_address=8)
+    Sr830(resource_name="ASRL3::INSTR", baud_rate=9600, interface="rs232")
+
+Most SR830 settings are selected by index into a fixed ladder rather than by
+value, so the ladders are given here and the properties accept and return real
+physical values, snapping to the nearest available setting.
+
+Commands and ranges are transcribed from the *SR830 DSP Lock-In Amplifier*
+manual, Chapter 5 (Remote Programming).
+"""
+
+import math
+import statistics
 import time
 
-import pyvisa as visa
+from ..core import (
+    Instrument,
+    check_boolean,
+    check_choice,
+    check_integer_range,
+    check_range,
+    nearest_allowed,
+)
+from ..core.errors import RangeError
 
-# create a logger object for this module
-logger = logging.getLogger(__name__)
-# added so that log messages show up in Jupyter notebooks
-logger.addHandler(logging.StreamHandler())
+# Sensitivity ladder for SENS, index 0 to 26, in volts (or microamps for the
+# current inputs) rms full scale.
+SENSITIVITIES = [
+    2e-9,
+    5e-9,
+    10e-9,
+    20e-9,
+    50e-9,
+    100e-9,
+    200e-9,
+    500e-9,
+    1e-6,
+    2e-6,
+    5e-6,
+    10e-6,
+    20e-6,
+    50e-6,
+    100e-6,
+    200e-6,
+    500e-6,
+    1e-3,
+    2e-3,
+    5e-3,
+    10e-3,
+    20e-3,
+    50e-3,
+    100e-3,
+    200e-3,
+    500e-3,
+    1.0,
+]
+
+# Time constant ladder for OFLT, index 0 to 19, in seconds.
+TIME_CONSTANTS = [
+    10e-6,
+    30e-6,
+    100e-6,
+    300e-6,
+    1e-3,
+    3e-3,
+    10e-3,
+    30e-3,
+    100e-3,
+    300e-3,
+    1.0,
+    3.0,
+    10.0,
+    30.0,
+    100.0,
+    300.0,
+    1e3,
+    3e3,
+    10e3,
+    30e3,
+]
+
+# Data sample rate ladder for SRAT, index 0 to 13, in hertz. Index 14 selects
+# external trigger instead of a fixed rate.
+SAMPLE_RATES = [
+    0.0625,
+    0.125,
+    0.25,
+    0.5,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    16.0,
+    32.0,
+    64.0,
+    128.0,
+    256.0,
+    512.0,
+]
+TRIGGERED_SAMPLE_RATE = 14
+
+FILTER_SLOPES = [6, 12, 18, 24]
+RESERVE_MODES = {"high reserve": 0, "normal": 1, "low noise": 2}
+INPUT_CONFIGURATIONS = {"a": 0, "a-b": 1, "i1m": 2, "i100m": 3}
+INPUT_GROUNDINGS = {"float": 0, "ground": 1}
+INPUT_COUPLINGS = {"ac": 0, "dc": 1}
+LINE_FILTERS = {"none": 0, "line": 1, "2x line": 2, "both": 3}
+REFERENCE_SOURCES = {"external": 0, "internal": 1}
+REFERENCE_SLOPES = {"sine": 0, "ttl rising": 1, "ttl falling": 2}
+SCAN_MODES = {"one shot": 0, "loop": 1}
+INTERFACES = {"rs232": 0, "gpib": 1}
+EXPANSIONS = {1: 0, 10: 1, 100: 2}
+
+# Channel display options for DDEF, per channel.
+CHANNEL1_DISPLAYS = {"x": 0, "r": 1, "x noise": 2, "aux1": 3, "aux2": 4}
+CHANNEL2_DISPLAYS = {"y": 0, "theta": 1, "y noise": 2, "aux3": 3, "aux4": 4}
+DISPLAY_RATIOS = {"none": 0, "aux1": 1, "aux2": 2}
+
+# Parameters SNAP? can read together, and what OUTP? indexes mean.
+SNAP_PARAMETERS = {
+    "x": 1,
+    "y": 2,
+    "r": 3,
+    "theta": 4,
+    "aux1": 5,
+    "aux2": 6,
+    "aux3": 7,
+    "aux4": 8,
+    "frequency": 9,
+    "channel1": 10,
+    "channel2": 11,
+}
+OUTPUT_PARAMETERS = {"x": 1, "y": 2, "r": 3, "theta": 4}
+OFFSET_PARAMETERS = {"x": 1, "y": 2, "r": 3}
+
+MINIMUM_FREQUENCY = 0.001
+MAXIMUM_FREQUENCY = 102000.0
+MAXIMUM_HARMONIC = 19999
+BUFFER_POINTS = 16383
 
 
-class Sr830:
-    """Interface to a Stanford Research Systems 830 lock in amplifier."""
+class Sr830(Instrument):
+    """Interface to an SR830 lock-in amplifier.
 
-    def __init__(self, gpib_addr):
-        """Create an instance of the Sr830 object.
+        lockin = Sr830(gpib_address=8)
+        lockin.time_constant = 0.1
+        lockin.sensitivity = 1e-6
+        x, y = lockin.snapshot("x", "y")
 
-        :param gpib_addr: GPIB address of the SR830
-        """
-        try:
-            # the pyvisa manager we'll use to connect to the GPIB resources
-            self.resource_manager = visa.ResourceManager()
-        except OSError:
-            logger.exception(
-                "\n\tCould not find the VISA library. Is the VISA driver installed?\n\n"
-            )
+    :param interface: Which port the instrument should answer on, 'gpib' or
+                      'rs232'. Sent as OUTX at construction. The SR830 will
+                      otherwise reply on whichever port it was last told to
+                      use, which is the usual cause of a lock-in that connects
+                      but never answers. Pass None to leave it alone.
+    """
 
-        self._gpib_addr = gpib_addr
-        self._instrument = None
-        self._instrument = self.resource_manager.open_resource(
-            "GPIB::%d" % self._gpib_addr
-        )
-        self.write_termination = "\n"
-        self.read_termination = "\n"
+    def __init__(self, *args, interface="gpib", **kwargs):
+        super().__init__(*args, **kwargs)
+        if interface is not None:
+            self.interface = interface
 
-    def single_measurement_mode(self):
-        """
-        This is the measurement mode you probably want.
-        I'm gonna be honest I have no idea where I found this command, so I am not sure it even does anything...
-        """
-        self._instrument.write("MEAS:CONT 0")
-        self._instrument.write("MEASU:CONT 0")
+    def identify(self):
+        """Return the instrument's identification string (``*IDN?``)."""
+        return self.query("*IDN?")
 
-    def clear_status_and_buffer(self):
-        self._instrument.write("*CLS")
-        self._instrument.write("REST")
-        self._instrument.write("CLRB")
+    def reset(self):
+        """Return the instrument to its default settings (``*RST``)."""
+        self.write("*RST")
 
-    @property
-    def sync_filter(self):
-        """
-        The state of the sync filter (< 200 Hz).
-        """
-        return self._instrument.query_ascii_values("SYNC?")[0]
+    def clear_status(self):
+        """Clear the status registers (``*CLS``)."""
+        self.write("*CLS")
 
-    @sync_filter.setter
-    def sync_filter(self, value):
-        if isinstance(value, bool):
-            self._instrument.query_ascii_values("SYNC {}".format(int(value)))
-        else:
-            raise RuntimeError("Sync filter input expects [True|False].")
-
-    @property
-    def low_pass_filter_slope(self):
-        """
-        The low pass filter slope in units of dB/octave. The choices are:
-
-         i   slope(dB/oct)
-        ---  -------------
-         0         6
-         1        12
-         2        18
-         3        24
-        """
-        response = self._instrument.query_ascii_values("OSFL?")[0]
-        slope = {"0": "6 dB/oct", "1": "12 dB/oct", "2": "18 dB/oct", "3": "24 dB/oct"}
-        return slope[response]
-
-    @low_pass_filter_slope.setter
-    def low_pass_filter_slope(self, value):
-        """
-        Sets the low pass filter slope.
-
-        :param value: The slope in units of dB/oct.
-        """
-        if value in (6, 12, 18, 24):
-            slope = {6: "0", 12: "1", 18: "2", 24: "3"}
-            self._instrument.query_ascii_values("OSFL {}".format(slope[value]))
-        else:
-            raise RuntimeError("Low pass filter slope only accepts [6|12|18|24].")
-
-    @property
-    def reserve(self):
-        """
-        The reserve mode of the SR830.
-        """
-        reserve = {"0": "high", "1": "normal", "2": "low noise"}
-        response = self._instrument.query_ascii_values("RMOD?")[0]
-        return reserve[response]
-
-    @reserve.setter
-    def reserve(self, value):
-        if isinstance(value, str):
-            mode = value.lower()
-        elif isinstance(value, int):
-            mode = value
-        else:
-            raise RuntimeError("Reserve expects a string or integer argument.")
-
-        modes_dict = {
-            "hi": 0,
-            "high": 0,
-            "high reserve": 0,
-            0: 0,
-            "normal": 1,
-            1: 1,
-            "lo": 2,
-            "low": 2,
-            "low noise": 2,
-            2: 2,
-        }
-        if mode in modes_dict.keys():
-            self._instrument.query_ascii_values("RMOD {}".format(mode))
-        else:
-            raise RuntimeError("Incorrect key for reserve.")
-
-    @property
-    def frequency(self):
-        """
-        The frequency of the output signal.
-        """
-        return self._instrument.query_ascii_values("FREQ?")[0]
-
-    @frequency.setter
-    def frequency(self, value):
-        if 0.001 <= value <= 102000:
-            self._instrument.write("FREQ {}".format(value))
-        else:
-            raise RuntimeError("Valid frequencies are between 0.001 Hz and 102 kHz.")
-
-    # INPUT and FILTER
-
-    @property
-    def input(self):
-        """
-        The input on the SR830 machine. Possible values:
-            0: A
-            1: A-B
-            2: I (1 MOhm)
-            3: I (100 MOhm)
-        """
-        return self._instrument.query_ascii_values("ISRC?")[0]
-
-    @input.setter
-    def input(self, input_value):
-        input_ = {
-            "0": 0,
-            0: 0,
-            "A": 0,
-            "1": 1,
-            1: 1,
-            "A-B": 1,
-            "DIFFERENTIAL": 1,
-            "2": 2,
-            2: 2,
-            "I1": 2,
-            "I1M": 2,
-            "I1MOHM": 2,
-            "3": 3,
-            3: 3,
-            "I100": 3,
-            "I100M": 3,
-            "I100MOHM": 3,
-        }
-        if isinstance(input_value, str):
-            query = (
-                input_value.upper().replace("(", "").replace(")", "").replace(" ", "")
-            )
-        else:
-            query = input_value
-
-        if query in input_.keys():
-            command = input_[query]
-            self._instrument.write("ISRC {}".format(command))
-        else:
-            raise RuntimeError("Unexpected input for SR830 input command.")
+    # Interface
 
     @property
-    def input_shield_grounding(self):
-        """Tells whether the shield is floating or grounded."""
-        response = self._instrument.query_ascii_values("IGND?")[0]
-        return {"0": "Float", "1": "Ground"}[response]
+    def interface(self):
+        """Returns which port the instrument replies on: 'gpib' or 'rs232'."""
+        return "gpib" if self.query_integer("OUTX?") == 1 else "rs232"
 
-    @input_shield_grounding.setter
-    def input_shield_grounding(self, ground_type):
-        ground_types = {
-            "float": "0",
-            "floating": "0",
-            "0": "0",
-            "ground": "1",
-            "grounded": "1",
-            "1": "1",
-        }
-        if ground_type.lower() in ground_types.keys():
-            self._instrument.write("IGND {}".format(ground_type.lower()))
-        else:
-            raise RuntimeError("Improper input grounding shield type.")
+    @interface.setter
+    def interface(self, value):
+        code = check_choice(value, INTERFACES, "output interface")
+        self.write(f"OUTX {code}")
+
+    @property
+    def remote_override(self):
+        """Returns whether the front panel stays live while under GPIB control."""
+        return self.query_boolean("OVRM?")
+
+    @remote_override.setter
+    def remote_override(self, value):
+        state = check_boolean(value, "remote override")
+        self.write(f"OVRM {int(state)}")
+
+    def go_to_local(self):
+        """Return the instrument to front-panel control."""
+        self.write("LOCL 0")
+
+    def go_to_remote(self):
+        """Put the instrument under remote control."""
+        self.write("LOCL 1")
+
+    def lock_front_panel(self):
+        """Put the instrument in remote with the front panel locked out."""
+        self.write("LOCL 2")
+
+    # Reference and phase
 
     @property
     def phase(self):
-        """
-        The phase of the output relative to the input.
-        """
-        return self._instrument.query_ascii_values("PHAS?")[0]
+        """Returns the reference phase shift, in degrees."""
+        return self.query_float("PHAS?")
 
     @phase.setter
     def phase(self, value):
-        if (
-            isinstance(value, float) or isinstance(value, int)
-        ) and -360.0 <= value <= 729.99:
-            self._instrument.write("PHAS {}".format(value))
-        else:
-            raise RuntimeError(
-                "Given phase is out of range for the SR830. Should be between -360.0 and 729.99."
-            )
+        check_range(value, -360.0, 729.99, "phase shift", " degrees")
+        self.write(f"PHAS {value}")
 
     @property
-    def amplitude(self):
-        """
-        The amplitude of the voltage output.
-        """
-        return self._instrument.query_ascii_values("SLVL?")[0]
+    def reference_source(self):
+        """Returns whether the reference is 'internal' or 'external'."""
+        return "internal" if self.query_integer("FMOD?") == 1 else "external"
 
-    @amplitude.setter
-    def amplitude(self, value):
-        if 0.004 <= value <= 5.0:
-            self._instrument.write("SLVL {}".format(value))
-        else:
-            raise RuntimeError(
-                "Given amplitude is out of range. Expected 0.004 to 5.0 V."
-            )
+    @reference_source.setter
+    def reference_source(self, value):
+        code = check_choice(value, REFERENCE_SOURCES, "reference source")
+        self.write(f"FMOD {code}")
 
     @property
-    def time_constant(self):
-        """
-        The time constant of the SR830.
-        """
-        time_constant = {
-            0: "10 us",
-            10: "1 s",
-            1: "30 us",
-            11: "3 s",
-            2: "100 us",
-            12: "10 s",
-            3: "300 us",
-            13: "30 s",
-            4: "1 ms",
-            14: "100 s",
-            5: "3 ms",
-            15: "300 s",
-            6: "10 ms",
-            16: "1 ks",
-            7: "30 ms",
-            17: "3 ks",
-            8: "100 ms",
-            18: "10 ks",
-            9: "300 ms",
-            19: "30 ks",
-        }
+    def frequency(self):
+        """Returns the reference frequency, in hertz."""
+        return self.query_float("FREQ?")
 
-        const_index = self._instrument.query_ascii_values("OFLT?")[0]
-        return time_constant[const_index]
-
-    @time_constant.setter
-    def time_constant(self, value):
-        if value.lower() == "increment":
-            if self.time_constant + 1 <= 19:
-                self.time_constant += 1
-        elif value.lower() == "decrement":
-            if self.time_constant - 1 >= 0:
-                self.time_constant -= 1
-        elif 0 <= value <= 19:
-            self._instrument.write("SENS {}".format(value))
-        else:
-            raise RuntimeError(
-                "Time constant index must be between 0 and 19 (inclusive)."
-            )
+    @frequency.setter
+    def frequency(self, value):
+        check_range(
+            value, MINIMUM_FREQUENCY, MAXIMUM_FREQUENCY, "reference frequency", " Hz"
+        )
+        self.write(f"FREQ {value}")
 
     @property
-    def sensitivity(self):
-        """Voltage/current sensitivity for inputs."""
-        sensitivity = {
-            0: 2e-9,
-            13: 50e-6,
-            1: 5e-9,
-            14: 100e-6,
-            2: 10e-9,
-            15: 200e-6,
-            3: 20e-9,
-            16: 500e-6,
-            4: 50e-9,
-            17: 1e-3,
-            5: 100e-9,
-            18: 2e-3,
-            6: 200e-9,
-            19: 5e-3,
-            7: 500e-9,
-            20: 10e-3,
-            8: 1e-6,
-            21: 20e-3,
-            9: 2e-6,
-            22: 50e-3,
-            10: 5e-6,
-            23: 100e-3,
-            11: 10e-6,
-            24: 200e-3,
-            12: 20e-6,
-            25: 500e-3,
-            26: 1,
-        }
+    def reference_slope(self):
+        """Returns the external reference trigger.
 
-        while True:
-            sens_key = self._instrument.query_ascii_values("SENS?")[0]
-            if sens_key in range(0, 27):
-                return [sens_key, sensitivity[sens_key]]
-            else:
-                self.reset_scan()
-                time.sleep(0.1)
-
-    @property
-    def sensitivityunits(self):
-        """Voltage/current sensitivity for inputs."""
-        sensitivity = {
-            0: "2 nV/fA",
-            13: "50 uV/pA",
-            1: "5 nV/fA",
-            14: "100 uV/pA",
-            2: "10 nV/fA",
-            15: "200 uV/pA",
-            3: "20 nV/fA",
-            16: "500 uV/pA",
-            4: "50 nV/fA",
-            17: "1 mV/nA",
-            5: "100 nV/fA",
-            18: "2 mV/nA",
-            6: "200 nV/fA",
-            19: "5 mV/nA",
-            7: "500 nV/fA",
-            20: "10 mV/nA",
-            8: "1 uV/pA",
-            21: "20 mV/nA",
-            9: "2 uV/pA",
-            22: "50 mV/nA",
-            10: "5 uV/pA",
-            23: "100 mV/nA",
-            11: "10 uV/pA",
-            24: "200 mV/nA",
-            12: "20 uV/pA",
-            25: "500 mV/nA",
-            26: "1 V/uA",
-        }
-
-        while True:
-            sens_key = self._instrument.query_ascii_values("SENS?")[0]
-            if sens_key in range(0, 27):
-                return sensitivity[sens_key]
-            else:
-                self.reset_scan()
-                time.sleep(0.1)
-
-    @sensitivity.setter
-    def sensitivity(self, value):
-        if isinstance(value, int) and 0 <= value <= 26:
-            self._instrument.write("SENS {}".format(value))
-        else:
-            raise RuntimeError("Invalid input for sensitivity.")
-
-    def overload_pass(self):
-        ovld_pass = True
-        self._instrument.query_ascii_values("LIAS? 0")[0]
-        self._instrument.query_ascii_values("LIAS? 1")[0]
-        self._instrument.query_ascii_values("LIAS? 2")[0]
-        if self._instrument.query_ascii_values("LIAS? 0")[0] != 0:
-            ovld_pass = False
-        else:
-            pass
-        if self._instrument.query_ascii_values("LIAS? 1")[0] != 0:
-            ovld_pass = False
-        else:
-            pass
-        if self._instrument.query_ascii_values("LIAS? 2")[0] != 0:
-            ovld_pass = False
-        else:
-            pass
-        return ovld_pass
-
-    def freq_lock_pass(self):
-        lock_pass = True
-        self._instrument.query_ascii_values("LIAS? 3")[0]
-
-        if self._instrument.query_ascii_values("LIAS? 3")[0] != 0:
-            lock_pass = False
-        else:
-            pass
-        return lock_pass
-
-    def set_display(self, channel, display, ratio=0):
-        """Set the display of the amplifier.
-
-        Display options are:
-        (for channel 1)     (for channel 2)
-            0: X            0: Y
-            1: R            1: Theta
-            2: X Noise      2: Y Noise
-            3: Aux in 1     3: Aux in 3
-            4: Aux in 2     4: Aux in 4
-
-        Ratio options are (i.e. divide output by):
-            0: none         0: none
-            1: Aux in 1     1: Aux in 3
-            2: Aux in 2     2: Aux in 4
-
-        Args:
-            channel (int): which channel to modify (1 or 2)
-            display (int): what to display
-            ratio (int, optional): display the output as a ratio
+        One of 'sine', 'ttl rising' or 'ttl falling'.
         """
-        self._instrument.write("DDEF {}, {}, {}".format(channel, display, ratio))
+        codes = {code: name for name, code in REFERENCE_SLOPES.items()}
+        return codes.get(self.query_integer("RSLP?"), "sine")
 
-    def get_display(self, channel):
-        """Get the display configuration of the amplifier.
-
-        Display options are:
-        (for channel 1)     (for channel 2)
-            0: X            0: Y
-            1: R            1: Theta
-            2: X Noise      2: Y Noise
-            3: Aux in 1     3: Aux in 3
-            4: Aux in 2     4: Aux in 4
-
-        Args:
-            channel (int): which channel to return the configuration for
-
-        Returns:
-            int: the parameter being displayed by the amplifier
-        """
-        return self._instrument.query_ascii_values("DDEF? {}".format(channel))
-
-    def single_output(self, value):
-        """Get the current value of a single parameter.
-        Possible parameter values are:
-            1: X
-            2: Y
-            3: R
-            4: Theta
-
-        Returns:
-            float: the value of the specified parameter
-        """
-        return self._instrument.query_ascii_values("OUTP? {}".format(value))[0]
-
-    def multiple_output(self, *values):
-        """Queries the SR830 for multiple output. See below for possibilities.
-
-        Possible parameters are:
-            1: X
-            2: Y
-            3: R
-            4: Theta
-            5: Aux in 1
-            6: Aux in 2
-            7: Aux in 3
-            8: Aux in 4
-            9: Reference frequency
-            10: CH1 display
-            11: CH2 display
-
-        :param values: A variable number of arguments to obtain output
-        :return:
-        """
-
-        command_string = "SNAP?" + " {}," * len(values)
-        return self._instrument.query_ascii_values(command_string.format(*values))
-
-    def auto_gain(self):
-        """
-        Mimics pressing the Auto Gain button. Does nothing if the time
-        constant is more than 1 second.
-        """
-        self._instrument.write("AGAN")
-
-    def auto_reserve(self):
-        """
-        Mimics pressing the Auto Reserve button.
-        """
-        self._instrument.write("ARSV")
-
-    def auto_phase(self):
-        """
-        Mimics pressing the Auto Phase button.
-        """
-        self._instrument.write("APHS")
-
-    def auto_offset(self, i):
-        """
-        Automatically offsets the given voltage parameter.
-
-        :param parameter: A string from ['x'|'y'|'r'], case insensitive.
-        """
-        if i in [1, 2, 3]:
-            self._instrument.write(f"AOFF {i}")
-        else:
-            raise RuntimeError("You can auto offset 1 (X), 2 (Y), or 3 (R).")
-
-    def expand(self, mult, offset=0, signal=1):
-        if signal in [1, 2, 3]:
-            if mult in [0, 1, 2]:
-                self._instrument.write(f"OEXP {signal},{offset},{mult}")
-            else:
-                raise RuntimeError("You can auto offset 1 (X), 2 (Y), or 3 (R).")
-        else:
-            raise RuntimeError("You can expand 1 (X), 2 (Y), or 3 (R).")
-
-    # Data storage commands
-
-    @property
-    def data_sample_rate(self):
-        """Data sample rate, which can be 62.5 mHz, 512 Hz, or Trigger.
-
-        Expected strings: 62.5, 62.5 mhz, 62.5mhz, mhz, 0, 512, 512hz, 512 hz,
-        hz, 13, trig, trigger, 14."""
-        rate_dict = {"0": "62.5 mHz", "13": "512 Hz", "14": "Trigger"}
-
-        response = self._instrument.query_ascii_values("SRAT?")[0]
-        return rate_dict[response]
-
-    @data_sample_rate.setter
-    def data_sample_rate(self, rate):
-        rate_dict = {
-            "62.5": "0",
-            "0": "0",
-            "62.5mhz": "0",
-            "mhz": "0",
-            "512": "13",
-            "13": "13",
-            "512hz": "13",
-            "hz": "13",
-            "trig": "14",
-            "14": "14",
-            "trigger": "14",
-        }
-        rate_value = str(rate).lower().replace(" ", "")
-        if rate_value in rate_dict.keys():
-            self._instrument.write("SRAT {}".format(rate_value))
-        else:
-            raise RuntimeError("Sample rate input not recognized.")
-
-    @property
-    def data_scan_mode(self):
-        """Data scan mode, which is either a 1-shot or a loop.
-
-        Expected strings: 1-shot, 1 shot, 1shot, loop."""
-        scan_modes = {"0": "1-shot", "1": "loop"}
-        response = self._instrument.query_ascii_values("SEND?")[0]
-        return scan_modes[response]
-
-    @data_scan_mode.setter
-    def data_scan_mode(self, scan_mode):
-        scan_modes = {"1shot": "0", "loop": "1"}
-        mode = scan_mode.replace("-", "").replace(" ", "")
-        self._instrument.write("SEND {}".format(scan_modes[mode]))
-
-    @property
-    def trigger_starts_scan(self):
-        """Determines if a Trigger starts scan mode."""
-        response = self._instrument.query_ascii_values("TSTR?")[0]
-        return {"0": False, "1": True}[response]
-
-    @trigger_starts_scan.setter
-    def trigger_starts_scan(self, starts):
-        starts_value = int(bool(starts))
-        self._instrument.write("TSTR {}".format(starts_value))
-
-    def trigger(self):
-        """Sends a software trigger."""
-        self._instrument.write("TRIG")
-
-    def start_scan(self):
-        """Starts or continues a scan."""
-        self._instrument.write("STRT")
-
-    def pause_scan(self):
-        """Pauses a scan."""
-        self._instrument.write("PAUS")
-
-    def reset_scan(self):
-        """Resets a scan and releases all stored data."""
-        self._instrument.write("REST")
-
-    @property
-    def offset_expand(self):
-        response = self._instrument.query_ascii_values("OEXP? 1")
-        expand = {0: 1, 1: 10, 2: 100}
-        return [response[0], expand[response[1]]]
+    @reference_slope.setter
+    def reference_slope(self, value):
+        code = check_choice(value, REFERENCE_SLOPES, "external reference slope")
+        self.write(f"RSLP {code}")
 
     @property
     def harmonic(self):
-        answer = self._instrument.query_ascii_values("HARM?")[0]
-        return answer
+        """Returns which harmonic of the reference is detected."""
+        return self.query_integer("HARM?")
 
     @harmonic.setter
-    def harmonic(self, i):
-        self._instrument.write(f"HARM {i}")
+    def harmonic(self, value):
+        harmonic = check_integer_range(value, 1, MAXIMUM_HARMONIC, "detection harmonic")
+        self.write(f"HARM {harmonic}")
+
+    @property
+    def amplitude(self):
+        """Returns the sine output amplitude, in volts rms."""
+        return self.query_float("SLVL?")
+
+    @amplitude.setter
+    def amplitude(self, value):
+        check_range(value, 0.004, 5.0, "sine output amplitude", " V rms")
+        self.write(f"SLVL {value}")
+
+    # Input and filtering
+
+    @property
+    def input_configuration(self):
+        """Returns the input wiring: 'a', 'a-b', 'i1m' or 'i100m'."""
+        codes = {code: name for name, code in INPUT_CONFIGURATIONS.items()}
+        return codes.get(self.query_integer("ISRC?"), "a")
+
+    @input_configuration.setter
+    def input_configuration(self, value):
+        code = check_choice(value, INPUT_CONFIGURATIONS, "input configuration")
+        self.write(f"ISRC {code}")
+
+    @property
+    def input_grounding(self):
+        """Returns whether the input shield is 'float' or 'ground'."""
+        return "ground" if self.query_integer("IGND?") == 1 else "float"
+
+    @input_grounding.setter
+    def input_grounding(self, value):
+        code = check_choice(value, INPUT_GROUNDINGS, "input shield grounding")
+        self.write(f"IGND {code}")
+
+    @property
+    def input_coupling(self):
+        """Returns whether the input is 'ac' or 'dc' coupled."""
+        return "dc" if self.query_integer("ICPL?") == 1 else "ac"
+
+    @input_coupling.setter
+    def input_coupling(self, value):
+        code = check_choice(value, INPUT_COUPLINGS, "input coupling")
+        self.write(f"ICPL {code}")
+
+    @property
+    def line_filter(self):
+        """Returns the notch filters in use: 'none', 'line', '2x line' or 'both'."""
+        codes = {code: name for name, code in LINE_FILTERS.items()}
+        return codes.get(self.query_integer("ILIN?"), "none")
+
+    @line_filter.setter
+    def line_filter(self, value):
+        code = check_choice(value, LINE_FILTERS, "line notch filter")
+        self.write(f"ILIN {code}")
+
+    @property
+    def sensitivity(self):
+        """Returns the full-scale sensitivity, in volts (or microamps) rms."""
+        return SENSITIVITIES[self.query_integer("SENS?")]
+
+    @sensitivity.setter
+    def sensitivity(self, value):
+        index, _ = nearest_allowed(value, SENSITIVITIES, "sensitivity", " V")
+        self.write(f"SENS {index}")
+
+    @property
+    def time_constant(self):
+        """Returns the output filter time constant, in seconds."""
+        return TIME_CONSTANTS[self.query_integer("OFLT?")]
+
+    @time_constant.setter
+    def time_constant(self, value):
+        index, _ = nearest_allowed(value, TIME_CONSTANTS, "time constant", " s")
+        self.write(f"OFLT {index}")
+
+    @property
+    def filter_slope(self):
+        """Returns the low-pass filter roll-off, in dB per octave: 6, 12, 18 or 24."""
+        return FILTER_SLOPES[self.query_integer("OFSL?")]
+
+    @filter_slope.setter
+    def filter_slope(self, value):
+        slope = check_choice(
+            int(value),
+            {s: i for i, s in enumerate(FILTER_SLOPES)},
+            "low pass filter slope",
+        )
+        self.write(f"OFSL {slope}")
+
+    @property
+    def synchronous_filter(self):
+        """Returns whether synchronous filtering is on (it applies below 200 Hz)."""
+        return self.query_boolean("SYNC?")
+
+    @synchronous_filter.setter
+    def synchronous_filter(self, value):
+        state = check_boolean(value, "synchronous filter")
+        self.write(f"SYNC {int(state)}")
+
+    @property
+    def reserve(self):
+        """Returns the dynamic reserve: 'high reserve', 'normal' or 'low noise'."""
+        codes = {code: name for name, code in RESERVE_MODES.items()}
+        return codes.get(self.query_integer("RMOD?"), "normal")
+
+    @reserve.setter
+    def reserve(self, value):
+        code = check_choice(value, RESERVE_MODES, "dynamic reserve")
+        self.write(f"RMOD {code}")
+
+    # Display and output routing
+
+    def set_display(self, channel, display, ratio="none"):
+        """Choose what a front-panel channel shows.
+
+        :param channel: 1 or 2.
+        :param display: For channel 1, one of 'x', 'r', 'x noise', 'aux1',
+                        'aux2'. For channel 2, 'y', 'theta', 'y noise',
+                        'aux3', 'aux4'.
+        :param ratio: Divide the display by 'none', 'aux1' or 'aux2'.
+        """
+        number = check_integer_range(channel, 1, 2, "display channel")
+        options = CHANNEL1_DISPLAYS if number == 1 else CHANNEL2_DISPLAYS
+        code = check_choice(display, options, f"channel {number} display")
+        ratio_code = check_choice(ratio, DISPLAY_RATIOS, "display ratio")
+        self.write(f"DDEF {number},{code},{ratio_code}")
+
+    def get_display(self, channel):
+        """Return what a channel is showing, as (display, ratio)."""
+        number = check_integer_range(channel, 1, 2, "display channel")
+        reply = self.query(f"DDEF? {number}")
+        code, _, ratio_code = reply.partition(",")
+        options = CHANNEL1_DISPLAYS if number == 1 else CHANNEL2_DISPLAYS
+        names = {value: name for name, value in options.items()}
+        ratios = {value: name for name, value in DISPLAY_RATIOS.items()}
+        return (
+            names.get(int(float(code)), code),
+            ratios.get(int(float(ratio_code or 0)), ratio_code),
+        )
+
+    def set_output_source(self, channel, source):
+        """Choose whether a rear output follows the display or X/Y directly.
+
+        :param channel: 1 or 2.
+        :param source: 'display' or 'xy'.
+        """
+        number = check_integer_range(channel, 1, 2, "output channel")
+        code = check_choice(source, {"display": 0, "xy": 1}, "output source")
+        self.write(f"FPOP {number},{code}")
+
+    def set_offset_and_expand(self, parameter, offset=0.0, expand=1):
+        """Offset and expand one of X, Y or R.
+
+        :param parameter: 'x', 'y' or 'r'.
+        :param offset: Offset as a percentage of full scale, -105 to 105.
+        :param expand: Gain applied after the offset: 1, 10 or 100.
+        """
+        index = check_choice(parameter, OFFSET_PARAMETERS, "offset parameter")
+        check_range(offset, -105.0, 105.0, "offset", " percent")
+        code = check_choice(int(expand), EXPANSIONS, "expand")
+        self.write(f"OEXP {index},{offset},{code}")
+
+    def get_offset_and_expand(self, parameter):
+        """Return the offset percentage and expansion of X, Y or R."""
+        index = check_choice(parameter, OFFSET_PARAMETERS, "offset parameter")
+        reply = self.query(f"OEXP? {index}")
+        offset, _, code = reply.partition(",")
+        expansions = {value: name for name, value in EXPANSIONS.items()}
+        return float(offset), expansions.get(int(float(code or 0)), 1)
+
+    def auto_offset(self, parameter):
+        """Offset X, Y or R so it reads zero now."""
+        index = check_choice(parameter, OFFSET_PARAMETERS, "offset parameter")
+        self.write(f"AOFF {index}")
+
+    def auto_gain(self):
+        """Choose the sensitivity automatically, as the AUTO GAIN key does."""
+        self.write("AGAN")
+
+    def auto_reserve(self):
+        """Choose the dynamic reserve automatically."""
+        self.write("ARSV")
+
+    def auto_phase(self):
+        """Adjust the reference phase so that Y reads zero."""
+        self.write("APHS")
+
+    # Auxiliary inputs and outputs
+
+    def auxiliary_input(self, channel):
+        """Read one of the four auxiliary inputs, in volts."""
+        number = check_integer_range(channel, 1, 4, "auxiliary input channel")
+        return self.query_float(f"OAUX? {number}")
+
+    def auxiliary_output(self, channel):
+        """Read back the setting of one of the four auxiliary outputs."""
+        number = check_integer_range(channel, 1, 4, "auxiliary output channel")
+        return self.query_float(f"AUXV? {number}")
+
+    def set_auxiliary_output(self, channel, voltage):
+        """Set one of the four auxiliary outputs, in volts."""
+        number = check_integer_range(channel, 1, 4, "auxiliary output channel")
+        check_range(voltage, -10.5, 10.5, "auxiliary output voltage", " V")
+        self.write(f"AUXV {number},{voltage}")
+
+    # Reading values
+
+    def output(self, parameter):
+        """Read one of X, Y, R or theta.
+
+        Reading these one at a time gives values from different instants. Use
+        snapshot() when the values have to be consistent with each other.
+        """
+        index = check_choice(parameter, OUTPUT_PARAMETERS, "output parameter")
+        return self.query_float(f"OUTP? {index}")
+
+    def display_value(self, channel):
+        """Read the value shown on channel 1 or 2."""
+        number = check_integer_range(channel, 1, 2, "display channel")
+        return self.query_float(f"OUTR? {number}")
+
+    def snapshot(self, *parameters):
+        """Read two to six values captured at the same instant.
+
+        X and Y read separately come from different moments, which matters when
+        the signal is moving. SNAP? samples them together.
+
+        :param parameters: Two to six of 'x', 'y', 'r', 'theta', 'aux1'..
+                           'aux4', 'frequency', 'channel1', 'channel2'.
+        :return: A list of floats, in the order asked for.
+        """
+        if not 2 <= len(parameters) <= 6:
+            raise RangeError(
+                "A snapshot reads between 2 and 6 parameters at once, but "
+                f"{len(parameters)} were given."
+            )
+        indexes = [
+            check_choice(parameter, SNAP_PARAMETERS, "snapshot parameter")
+            for parameter in parameters
+        ]
+        return self.query_floats("SNAP? " + ",".join(str(i) for i in indexes))
+
+    @property
+    def x(self):
+        """Returns the in-phase component, in volts."""
+        return self.output("x")
+
+    @property
+    def y(self):
+        """Returns the quadrature component, in volts."""
+        return self.output("y")
+
+    @property
+    def magnitude(self):
+        """Returns the signal magnitude R, in volts."""
+        return self.output("r")
+
+    @property
+    def theta(self):
+        """Returns the signal phase, in degrees."""
+        return self.output("theta")
+
+    # Data buffer
+
+    @property
+    def sample_rate(self):
+        """Returns the buffer sample rate in hertz.
+
+        Returns 'trigger' when the buffer is clocked externally.
+        """
+        index = self.query_integer("SRAT?")
+        return "trigger" if index == TRIGGERED_SAMPLE_RATE else SAMPLE_RATES[index]
+
+    @sample_rate.setter
+    def sample_rate(self, value):
+        if str(value).strip().lower() == "trigger":
+            self.write(f"SRAT {TRIGGERED_SAMPLE_RATE}")
+            return
+        index, _ = nearest_allowed(value, SAMPLE_RATES, "sample rate", " Hz")
+        self.write(f"SRAT {index}")
+
+    @property
+    def scan_mode(self):
+        """Returns whether the buffer stops when full ('one shot') or wraps ('loop')."""
+        return "loop" if self.query_integer("SEND?") == 1 else "one shot"
+
+    @scan_mode.setter
+    def scan_mode(self, value):
+        code = check_choice(value, SCAN_MODES, "scan mode")
+        self.write(f"SEND {code}")
+
+    @property
+    def trigger_starts_scan(self):
+        """Returns whether a trigger starts the scan as well as clocking it."""
+        return self.query_boolean("TSTR?")
+
+    @trigger_starts_scan.setter
+    def trigger_starts_scan(self, value):
+        state = check_boolean(value, "trigger starts scan")
+        self.write(f"TSTR {int(state)}")
+
+    def trigger(self):
+        """Send a software trigger, equivalent to the rear trigger input."""
+        self.write("TRIG")
+
+    def start_scan(self):
+        """Start or resume filling the buffer."""
+        self.write("STRT")
+
+    def pause_scan(self):
+        """Pause the scan, keeping what has been stored."""
+        self.write("PAUS")
+
+    def reset_scan(self):
+        """Stop the scan and discard everything stored."""
+        self.write("REST")
+
+    @property
+    def buffer_count(self):
+        """Returns how many points are stored in the buffer."""
+        return self.query_integer("SPTS?")
+
+    def read_buffer(self, channel, start=0, count=None):
+        """Read stored points out of a display buffer.
+
+        :param channel: Which display buffer, 1 or 2.
+        :param start: First bin to read, counting from 0.
+        :param count: How many points to read. Defaults to all of them from
+                      ``start`` onwards.
+        :return: A list of floats.
+        """
+        number = check_integer_range(channel, 1, 2, "display channel")
+        first = check_integer_range(start, 0, BUFFER_POINTS, "starting bin")
+        if count is None:
+            count = max(self.buffer_count - first, 0)
+        points = check_integer_range(count, 1, BUFFER_POINTS, "number of points")
+        return self.query_floats(f"TRCA? {number},{first},{points}")
+
+    # Front panel and setups
+
+    @property
+    def key_click(self):
+        """Returns whether the front-panel keys click."""
+        return self.query_boolean("KCLK?")
+
+    @key_click.setter
+    def key_click(self, value):
+        state = check_boolean(value, "key click")
+        self.write(f"KCLK {int(state)}")
+
+    @property
+    def alarms(self):
+        """Returns whether the audible alarms sound."""
+        return self.query_boolean("ALRM?")
+
+    @alarms.setter
+    def alarms(self, value):
+        state = check_boolean(value, "alarms")
+        self.write(f"ALRM {int(state)}")
+
+    def save_setup(self, buffer):
+        """Store the current settings in one of nine setup buffers."""
+        number = check_integer_range(buffer, 1, 9, "setup buffer")
+        self.write(f"SSET {number}")
+
+    def recall_setup(self, buffer):
+        """Restore settings from one of nine setup buffers."""
+        number = check_integer_range(buffer, 1, 9, "setup buffer")
+        self.write(f"RSET {number}")
+
+    # Status
+
+    @property
+    def status_byte(self):
+        """Returns the serial poll status byte (``*STB?``)."""
+        return self.query_integer("*STB?")
+
+    @property
+    def lockin_status(self):
+        """Returns the lock-in status byte.
+
+        The byte reports overloads and whether the reference is locked.
+        """
+        return self.query_integer("LIAS?")
+
+    @property
+    def error_status(self):
+        """Returns the error status byte."""
+        return self.query_integer("ERRS?")
+
+    def input_overload(self):
+        """Whether the input or amplifier is overloaded.
+
+        Bit 0 of the lock-in status byte. A reading taken while overloaded is
+        not trustworthy.
+        """
+        return bool(self.lockin_status & 0b1)
+
+    def filter_overload(self):
+        """Whether the time-constant filter is overloaded (bit 1)."""
+        return bool(self.lockin_status & 0b10)
+
+    def output_overload(self):
+        """Whether an output is railed (bit 2)."""
+        return bool(self.lockin_status & 0b100)
+
+    def reference_unlocked(self):
+        """Whether the reference is unlocked (bit 3).
+
+        An unlocked reference means the instrument is not measuring at the
+        frequency you think it is.
+        """
+        return bool(self.lockin_status & 0b1000)
+
+    def overloaded(self):
+        """Whether any overload is present."""
+        return bool(self.lockin_status & 0b111)
+
+    # Common procedures
+
+    def settling_time(self, time_constants=5):
+        """How long to wait for the output filter to settle after a change.
+
+        A single-pole filter is within 1% of a step after five time constants.
+        Each extra 6 dB/octave of roll-off is another pole, and each pole adds
+        its own settling, so the wait is scaled by the filter order.
+
+        :param time_constants: How many time constants to allow per pole.
+        :return: The wait, in seconds.
+        """
+        poles = self.filter_slope / 6
+        return self.time_constant * float(time_constants) * poles
+
+    def wait_to_settle(self, time_constants=5):
+        """Sleep long enough for the output filter to settle.
+
+        Reading immediately after changing the sensitivity, the time constant
+        or anything about the sample gives the filter's old contents, not the
+        new signal.
+
+        :return: How long was waited, in seconds.
+        """
+        delay = self.settling_time(time_constants)
+        time.sleep(delay)
+        return delay
+
+    def measure(self, settle=True, time_constants=5):
+        """Read X and Y together, after letting the filter settle.
+
+        :param settle: Wait for the output filter first.
+        :return: A tuple of (X, Y) in volts, captured at the same instant.
+        """
+        if settle:
+            self.wait_to_settle(time_constants)
+        x, y = self.snapshot("x", "y")
+        return x, y
+
+    def measure_average(self, count=10, interval=None, settle=True):
+        """Average several X and Y readings and report the scatter.
+
+        :param count: How many readings to take.
+        :param interval: Seconds between readings, defaulting to one time
+                         constant so successive readings are not correlated.
+        :param settle: Wait for the filter to settle before starting.
+        :return: A tuple of (mean X, mean Y, standard error of X, standard
+                 error of Y).
+        """
+        number = check_integer_range(count, 1, 100000, "number of readings")
+        if settle:
+            self.wait_to_settle()
+        if interval is None:
+            interval = self.time_constant
+
+        xs, ys = [], []
+        for index in range(number):
+            if index:
+                time.sleep(interval)
+            x, y = self.snapshot("x", "y")
+            xs.append(x)
+            ys.append(y)
+
+        if number < 2:
+            return xs[0], ys[0], 0.0, 0.0
+        root = math.sqrt(number)
+        return (
+            statistics.fmean(xs),
+            statistics.fmean(ys),
+            statistics.stdev(xs) / root,
+            statistics.stdev(ys) / root,
+        )
+
+    def ramp_amplitude(self, target, steps=50, delay=0.05):
+        """Walk the drive amplitude to a new value instead of stepping to it.
+
+        A sudden change in drive puts a transient through the sample and takes
+        the lock-in several time constants to recover from.
+
+        :param target: Amplitude to finish at, in volts rms.
+        :param steps: How many intermediate levels to pass through.
+        :param delay: Seconds to wait at each step.
+        """
+        target = check_range(target, 0.004, 5.0, "sine output amplitude", " V rms")
+        number = check_integer_range(steps, 1, 100000, "number of steps")
+        check_range(delay, 0, 3600, "step delay", " s")
+
+        start = self.amplitude
+        for step in range(1, number + 1):
+            self.amplitude = start + (target - start) * step / number
+            time.sleep(delay)
+
+    def __repr__(self):
+        return f"Sr830({self._transport!r})"

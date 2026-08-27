@@ -1,650 +1,1268 @@
+"""Driver for the Keithley 2400 series SourceMeter.
+
+Covers the whole series, meaning the 2400, 2400-LV, 2401, 2410, 2420, 2425,
+2430 and 2440, which differ in how much they can source. Source and compliance
+limits come from the model, detected from ``*IDN?`` at construction, so a 2410
+is allowed its 1100 V while a 2440 is held to 42 V.
+
+Commands and ranges are transcribed from the *2400 Series SourceMeter User's
+Manual*, Section 18 (SCPI Command Reference).
+"""
+
 import time
-from statistics import mean, stdev
 
-import numpy as np
-import pyvisa as visa
+from ..core import (
+    ScpiInstrument,
+    check_boolean,
+    check_choice,
+    check_integer_range,
+    check_range,
+)
+from ..core.errors import RangeError
+from ..core.sweep import round_trip, sweep_values
+
+# Maximum source magnitudes per model, as (current in amps, voltage in volts),
+# from the :SOURce:VOLTage:STARt/:STOP parameter tables, manual page 18-84.
+MODEL_LIMITS = {
+    "2400": (1.05, 210.0),
+    "2400-LV": (1.05, 21.0),
+    "2401": (1.05, 21.0),
+    "2410": (1.05, 1100.0),
+    "2420": (3.15, 63.0),
+    "2425": (3.15, 105.0),
+    "2430": (3.15, 105.0),
+    "2430-PULSE": (10.5, 105.0),
+    "2440": (5.25, 42.0),
+}
+
+DEFAULT_MODEL = "2400"
+
+# Front-panel key codes for :SYSTem:KEY, from manual page 18-110. Code 25 is
+# unassigned. These allow the instrument to be driven exactly as if someone
+# were standing in front of it.
+FRONT_PANEL_KEYS = {
+    "range_up": 1,
+    "source_down": 2,
+    "left": 3,
+    "menu": 4,
+    "function": 5,
+    "filter": 6,
+    "speed": 7,
+    "edit": 8,
+    "auto": 9,
+    "right": 10,
+    "exit": 11,
+    "source_voltage": 12,
+    "limits": 13,
+    "store": 14,
+    "measure_voltage": 15,
+    "toggle": 16,
+    "range_down": 17,
+    "enter": 18,
+    "source_current": 19,
+    "trigger": 20,
+    "recall": 21,
+    "measure_current": 22,
+    "local": 23,
+    "output": 24,
+    "source_up": 26,
+    "sweep": 27,
+    "config": 28,
+    "measure_resistance": 29,
+    "relative": 30,
+    "digits": 31,
+    "front_rear": 32,
+}
+
+SOURCE_FUNCTIONS = {"voltage": "VOLT", "current": "CURR", "memory": "MEM"}
+SOURCE_MODES = {"fixed": "FIX", "sweep": "SWE", "list": "LIST"}
+MEASURE_FUNCTIONS = {"voltage": "VOLT:DC", "current": "CURR:DC", "resistance": "RES"}
+OUTPUT_OFF_MODES = {
+    "high impedance": "HIMP",
+    "normal": "NORM",
+    "zero": "ZERO",
+    "guard": "GUAR",
+}
+FILTER_TYPES = {"moving": "MOV", "repeating": "REP"}
+SWEEP_SPACINGS = {"linear": "LIN", "logarithmic": "LOG"}
+SWEEP_DIRECTIONS = {"up": "UP", "down": "DOWN"}
+SWEEP_RANGINGS = {"best": "BEST", "auto": "AUTO", "fixed": "FIX"}
+BUFFER_SOURCES = {"sense": "SENS", "calculate1": "CALC1", "calculate2": "CALC2"}
+BUFFER_CONTROLS = {"next": "NEXT", "never": "NEV"}
+TIMESTAMP_FORMATS = {"absolute": "ABS", "delta": "DELT"}
+TRIGGER_SOURCES = {"immediate": "IMM", "trigger link": "TLIN"}
+ARM_SOURCES = {
+    "immediate": "IMM",
+    "timer": "TIM",
+    "manual": "MAN",
+    "bus": "BUS",
+    "trigger link": "TLIN",
+    "nstest": "NST",
+    "pstest": "PST",
+    "bstest": "BST",
+}
+DATA_ELEMENTS = {
+    "voltage": "VOLT",
+    "current": "CURR",
+    "resistance": "RES",
+    "time": "TIME",
+    "status": "STAT",
+}
+STATISTICS = {
+    "mean": "MEAN",
+    "standard deviation": "SDEV",
+    "maximum": "MAX",
+    "minimum": "MIN",
+    "peak to peak": "PKPK",
+}
+
+MAXIMUM_BUFFER_POINTS = 2500
 
 
-class Keithley2400:
-    def __init__(self, gpib_addr):
-        """
-        Constructor for Keithley 2400 Sourcemeter
+class Keithley2400(ScpiInstrument):
+    """Interface to a Keithley 2400 series SourceMeter.
 
-        :param gpib_addr: GPIB address (configured on Keithley 2400)
-        """
-        self._gpib_addr = str(gpib_addr)
-        self._resource_manager = visa.ResourceManager()
-        self._instrument = self._resource_manager.open_resource(
-            "GPIB::{}".format(self.gpib_addr)
-        )
+        source = Keithley2400(gpib_address=24)
+        source.source_function = "voltage"
+        source.current_compliance = 1e-3
+        source.source_value = 0.5
+        source.output = True
+        voltage, current = source.read("voltage", "current")
+
+    :param model: Which model this is, e.g. '2410'. Detected from *IDN? when
+                  not given. Worth passing explicitly for a 2400-LV or a 2401,
+                  which both identify as a plain 2400 but source only 21 V.
+    """
+
+    IDENTIFIER = "MODEL 24"
+
+    def __init__(self, *args, model=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._model = None
+        self.model = model if model is not None else self._detect_model()
+
+    def _detect_model(self):
+        """Read the model number out of the instrument's identification."""
+        try:
+            identity = self.identify()
+        except Exception:
+            return DEFAULT_MODEL
+        flattened = identity.replace("-", "").upper()
+        for name in sorted(MODEL_LIMITS, key=len, reverse=True):
+            if name.replace("-", "").upper() in flattened:
+                return name
+        return DEFAULT_MODEL
 
     @property
-    def gpib_addr(self):
-        """Returns the GPIB address of the Keithley 2400 Sourcemeter."""
-        return self._gpib_addr
+    def model(self):
+        """Returns the model number, which sets the source and compliance limits."""
+        return self._model
 
-    # source functions
+    @model.setter
+    def model(self, value):
+        name = str(value).upper().strip()
+        if name not in MODEL_LIMITS:
+            raise RangeError(
+                f"'{value}' is not a Keithley 2400 series model. Known models "
+                f"are {', '.join(sorted(MODEL_LIMITS))}."
+            )
+        self._model = name
+        self._maximum_current, self._maximum_voltage = MODEL_LIMITS[name]
 
     @property
-    def source_type(self):
-        """Gets or sets the source type of the Keithley 2400 SourceMeter.
+    def maximum_current(self):
+        """Returns the largest current this model can source, in amps."""
+        return self._maximum_current
 
-        Expected strings for setting: 'voltage', 'current'"""
-        response = self._instrument.query("source:function:mode?").strip()
-        source_type = {"VOLT": "voltage", "CURR": "current"}
-        return source_type[response]
+    @property
+    def maximum_voltage(self):
+        """Returns the largest voltage this model can source, in volts."""
+        return self._maximum_voltage
 
-    @source_type.setter
-    def source_type(self, value):
-        if value.lower() == "voltage" or value.lower() == "v":
-            source = "voltage"
-            self._instrument.write("source:function:mode {}".format(source.lower()))
-        elif value.lower() == "current" or value.lower() == "i":
-            source = "current"
-            self._instrument.write("source:function:mode {}".format(source.lower()))
-        else:
-            raise RuntimeError("Not a valid source type.")
+    def _active_source_code(self):
+        """SCPI keyword for whichever source is currently selected."""
+        function = self.source_function
+        if function == "memory":
+            raise RangeError(
+                "The source is in memory mode, which has no voltage or current "
+                "level. Set source_function to 'voltage' or 'current' first."
+            )
+        return SOURCE_FUNCTIONS.get(function, "VOLT")
+
+    def _source_limit(self, function=None):
+        """Largest magnitude the given source can produce on this model.
+
+        Every setter that writes a source level calls this first, so the
+        memory-mode check here guards all of them.
+
+        :raises RangeError: If the source is in memory mode, which has no
+                            voltage or current level to set.
+        """
+        function = function or self.source_function
+        if function == "memory":
+            raise RangeError(
+                "The source is in memory mode, which has no voltage or current "
+                "level. Set source_function to 'voltage' or 'current' first."
+            )
+        return self._maximum_current if function == "current" else self._maximum_voltage
+
+    def _source_unit(self, function):
+        return " A" if function == "current" else " V"
+
+    # Source configuration
+
+    @property
+    def source_function(self):
+        """Returns which source is used: 'voltage', 'current' or 'memory'."""
+        reply = self.query(":SOUR:FUNC:MODE?").strip().upper()
+        for name, code in SOURCE_FUNCTIONS.items():
+            if reply.startswith(code):
+                return name
+        return reply
+
+    @source_function.setter
+    def source_function(self, value):
+        code = check_choice(value, SOURCE_FUNCTIONS, "source function")
+        self.write(f":SOUR:FUNC:MODE {code}")
 
     @property
     def source_mode(self):
-        """Gets or sets the mode of the source.
-
-        Expected strings for setting: 'fixed', 'sweep', 'list'"""
-        # TODO: test
-        return self._instrument.query("source:" + self.source_type.lower() + ":mode?")
+        """Returns how the active source steps: 'fixed', 'sweep' or 'list'."""
+        reply = self.query(f":SOUR:{self._active_source_code()}:MODE?").strip().upper()
+        for name, code in SOURCE_MODES.items():
+            if reply.startswith(code):
+                return name
+        return reply
 
     @source_mode.setter
-    def source_mode(self, mode):
-        if mode.lower() in ("fixed", "sweep", "list"):
-            self._instrument.write(
-                "source:" + self.source_type.lower() + ":mode {}".format(mode)
-            )
-        else:
-            raise RuntimeError("Mode is not one of [fixed | sweep | list]")
-
-    def auto_range_sense(self, state):
-        if self.measure_type == "voltage":
-            measure_mode = "VOLTage"
-        elif self.measure_type == "current":
-            measure_mode = "CURRent"
-        elif self.measure_type == "resistance":
-            measure_mode = "RESistance"
-        else:
-            raise RuntimeError(
-                "Could not figure out if the measurement type was 'voltage', 'current', or 'resistance'."
-            )
-        if state.lower() in ("on", "off"):
-            self._instrument.write(f":SENSe:{measure_mode}:RANGe:AUTO {state.upper()}")
-        else:
-            raise RuntimeError("You can only turn auto range 'OFF' or 'ON'.")
+    def source_mode(self, value):
+        code = check_choice(value, SOURCE_MODES, "source mode")
+        self.write(f":SOUR:{self._active_source_code()}:MODE {code}")
 
     @property
     def source_value(self):
-        """Get or set the numeric value of the source chosen from Keithley2400.source_type."""
-        # TODO: test
-        return self._instrument.query("source:" + self.source_type.lower() + ":level?")
+        """Returns the level of the active source, in amps or volts."""
+        return self.query_float(f":SOUR:{self._active_source_code()}:LEV?")
 
     @source_value.setter
     def source_value(self, value):
-        self._instrument.write("source:function:mode " + self.source_type.lower())
-        self._instrument.write(
-            "source:" + self.source_type.lower() + ":range " + str(value)
+        function = self.source_function
+        limit = self._source_limit(function)
+        check_range(
+            value,
+            -limit,
+            limit,
+            f"{function} source level",
+            self._source_unit(function),
         )
-        self._instrument.write(
-            "source:" + self.source_type.lower() + ":level " + str(value)
-        )
-
-    def ramp_to_setpoint(self, setpoint, n_step=1001, sleep_time=0.02):
-        startpoint = self._instrument.query(
-            "source:" + self.source_type.lower() + ":level?"
-        )
-        value_list = np.linspace(float(startpoint), float(setpoint), n_step)
-        for value in value_list:
-            time.sleep(sleep_time)
-            self._instrument.write("source:function:mode " + self.source_type.lower())
-            self._instrument.write(
-                "source:" + self.source_type.lower() + ":range " + str(value)
-            )
-            self._instrument.write(
-                "source:" + self.source_type.lower() + ":level " + str(value)
-            )
+        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:LEV {value}")
 
     @property
-    def measure_type(self):
-        """The type of measurement the Keithley 2400 SourceMeter will make.
+    def source_voltage(self):
+        """Returns the voltage source level, in volts."""
+        return self.query_float(":SOUR:VOLT:LEV?")
 
-        Expected strings for setting: 'voltage', 'current', 'resistance'
+    @source_voltage.setter
+    def source_voltage(self, value):
+        limit = self._maximum_voltage
+        check_range(value, -limit, limit, "source voltage", " V")
+        self.write(f":SOUR:VOLT:LEV {value}")
+
+    @property
+    def source_current(self):
+        """Returns the current source level, in amps."""
+        return self.query_float(":SOUR:CURR:LEV?")
+
+    @source_current.setter
+    def source_current(self, value):
+        limit = self._maximum_current
+        check_range(value, -limit, limit, "source current", " A")
+        self.write(f":SOUR:CURR:LEV {value}")
+
+    @property
+    def source_range(self):
+        """Returns the range of the active source.
+
+        Setting a range turns source autoranging off.
         """
-        measure_type = {"VOLT:DC": "voltage", "CURR:DC": "current", "RES": "resistance"}
-        measure_type_response = (
-            self._instrument.query("sense:function?")
-            .strip()
-            .replace('"', "")
-            .split(",")[-1]
+        return self.query_float(f":SOUR:{self._active_source_code()}:RANG?")
+
+    @source_range.setter
+    def source_range(self, value):
+        function = self.source_function
+        limit = self._source_limit(function)
+        check_range(
+            value,
+            -limit,
+            limit,
+            f"{function} source range",
+            self._source_unit(function),
         )
-        return measure_type[measure_type_response]
+        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:RANG {value}")
 
-    @measure_type.setter
-    def measure_type(self, value):
-        measure_type = {
-            "voltage": "'VOLTAGE:DC'",
-            "current": "'CURRENT:DC'",
-            "resistance": "RESISTANCE",
-        }
-        if value.lower() in measure_type:
-            self._instrument.write(
-                "sense:function:ON {}".format(measure_type[value.lower()])
+    @property
+    def source_auto_range(self):
+        """Returns whether the source picks its own range."""
+        return self.query_boolean(f":SOUR:{self._active_source_code()}:RANG:AUTO?")
+
+    @source_auto_range.setter
+    def source_auto_range(self, value):
+        state = check_boolean(value, "source autorange")
+        self.write(f":SOUR:{self._active_source_code()}:RANG:AUTO {int(state)}")
+
+    @property
+    def source_delay(self):
+        """Returns the settling time between setting the source and measuring.
+
+        In seconds.
+        """
+        return self.query_float(":SOUR:DEL?")
+
+    @source_delay.setter
+    def source_delay(self, value):
+        check_range(value, 0, 9999.999, "source delay", " s")
+        self.write(f":SOUR:DEL {value}")
+
+    @property
+    def source_auto_delay(self):
+        """Returns whether the instrument chooses its own source settling time."""
+        return self.query_boolean(":SOUR:DEL:AUTO?")
+
+    @source_auto_delay.setter
+    def source_auto_delay(self, value):
+        state = check_boolean(value, "source auto delay")
+        self.write(f":SOUR:DEL:AUTO {int(state)}")
+
+    @property
+    def source_voltage_protection(self):
+        """Returns the hard limit on the voltage source, in volts.
+
+        The limit applies whatever the source level is set to.
+        """
+        return self.query_float(":SOUR:VOLT:PROT:LEV?")
+
+    @source_voltage_protection.setter
+    def source_voltage_protection(self, value):
+        check_range(value, 0, self._maximum_voltage, "source voltage protection", " V")
+        self.write(f":SOUR:VOLT:PROT:LEV {value}")
+
+    @property
+    def auto_output_off(self):
+        """Returns whether the output switches off after each measurement."""
+        return self.query_boolean(":SOUR:CLE:AUTO?")
+
+    @auto_output_off.setter
+    def auto_output_off(self, value):
+        state = check_boolean(value, "auto output off")
+        self.write(f":SOUR:CLE:AUTO {int(state)}")
+
+    # Measurement configuration
+
+    @property
+    def measure_functions(self):
+        """Returns which quantities are being measured, as a list of names."""
+        reply = self.query(":SENS:FUNC:ON?").upper()
+        return [name for name, code in MEASURE_FUNCTIONS.items() if code in reply]
+
+    @measure_functions.setter
+    def measure_functions(self, values):
+        if isinstance(values, str):
+            values = [values]
+        codes = [
+            check_choice(value, MEASURE_FUNCTIONS, "measure function")
+            for value in values
+        ]
+        if not codes:
+            raise RangeError(
+                "At least one measure function is needed. Choose from "
+                f"{', '.join(sorted(MEASURE_FUNCTIONS))}."
             )
-        else:
-            raise RuntimeError(
-                "Expected a value from ['voltage'|'current'|'resistance'"
-            )
-
-    # Resistance sensing
+        self.write(":SENS:FUNC:CONC ON")
+        self.write(":SENS:FUNC:OFF:ALL")
+        self.write(":SENS:FUNC:ON " + ",".join(f"'{code}'" for code in codes))
 
     @property
-    def resistance_ohms_mode(self):
-        """Gets or sets the resistance mode.
+    def concurrent_measurement(self):
+        """Returns whether more than one quantity can be measured at once."""
+        return self.query_boolean(":SENS:FUNC:CONC?")
 
-        Expected strings for setting: 'manual', 'auto'"""
-        modes = {"MAN": "manual", "AUTO": "auto"}
-        response = self._instrument.query("sense:resistance:mode?").strip()
-        return modes[response]
-
-    @resistance_ohms_mode.setter
-    def resistance_ohms_mode(self, value):
-        modes = {"manual": "MAN", "auto": "AUTO"}
-        if value.lower() in modes.keys():
-            self._instrument.write(
-                "sense:resistance:mode {}".format(modes[value.lower()])
-            )
-        else:
-            raise RuntimeError("Expected a value from ['manual'|'auto']")
-
-    @property
-    def expected_ohms_reading(self):
-        """Gets or sets the expected range of a resistance reading from the device under test."""
-        response = self._instrument.query("sense:resistance:range?").strip()
-        return float(response)
-
-    @expected_ohms_reading.setter
-    def expected_ohms_reading(self, value):
-        if isinstance(value, int) or isinstance(value, float):
-            self._instrument.write("sense:resistance:range {}".format(value))
-        else:
-            raise RuntimeError("Expected an int or float.")
-
-    @property
-    def four_wire_sensing(self):
-        """Gets the status of or sets four-wire sensing.
-
-        Expected booleans for setting: True, False."""
-        response = self._instrument.query("system:rsense?").strip()
-        return bool(int(response))
-
-    @four_wire_sensing.setter
-    def four_wire_sensing(self, value):
-        if isinstance(value, bool):
-            self._instrument.write("system:rsense {}".format(int(value)))
-        else:
-            raise RuntimeError("Expected boolean value.")
-
-    # Voltage sensing and compliance
-
-    @property
-    def expected_voltage_reading(self):
-        """Gets or sets the expected voltage reading from the device under test."""
-        response = self._instrument.query("sense:voltage:RANGE?").strip()
-        return float(response)
-
-    @expected_voltage_reading.setter
-    def expected_voltage_reading(self, value):
-        if isinstance(value, int) or isinstance(value, float):
-            self._instrument.write("sense:voltage:range {}".format(value))
-        else:
-            raise RuntimeError("Expected an int or float.")
-
-    @property
-    def voltage_compliance(self):
-        """Gets or sets the voltage compliance.
-
-        Expected range of floats: 200e-6 <= x <= 210"""
-        response = self._instrument.query("SENS:VOLT:PROT:LEV?").strip()
-        return float(response)
-
-    @voltage_compliance.setter
-    def voltage_compliance(self, value):
-        if 200e-6 <= value <= 210:
-            self._instrument.write("SENS:VOLT:PROT {}".format(str(value)))
-        else:
-            raise RuntimeError(
-                "Voltage compliance cannot be set. Value must be between 200 \u03BC"
-                + "V and 210 V."
-            )
-
-    def within_voltage_compliance(self):
-        """Queries if the measured voltage is within the set compliance.
-
-        :returns: boolean"""
-        response = self._instrument.query("SENS:VOLT:PROT:TRIP?").strip()
-        return not bool(int(response))
-
-    # Current sensing and compilance
-
-    @property
-    def expected_current_reading(self):
-        """Gets or sets the expected current reading from the device under test."""
-        response = self._instrument.query("sense:current:range?").strip()
-        return float(response)
-
-    @expected_current_reading.setter
-    def expected_current_reading(self, value):
-        if isinstance(value, int) or isinstance(value, float):
-            self._instrument.write("sense:current:range {}".format(value))
-        else:
-            RuntimeError("Expected an int or float.")
+    @concurrent_measurement.setter
+    def concurrent_measurement(self, value):
+        state = check_boolean(value, "concurrent measurement")
+        self.write(f":SENS:FUNC:CONC {int(state)}")
 
     @property
     def current_compliance(self):
-        """Sets or gets the current compliance level in Amperes."""
-        response = self._instrument.query("SENS:CURR:PROT:LEV?").strip()
-        return float(response)
+        """Returns the current the source will not be allowed to exceed, in amps."""
+        return self.query_float(":SENS:CURR:PROT:LEV?")
 
     @current_compliance.setter
     def current_compliance(self, value):
-        if 1e-9 <= value <= 1.05:
-            self._instrument.write("SENS:CURR:PROT {}".format(str(value)))
-        else:
-            raise RuntimeError(
-                "Current compliance cannot be set. Value must be between 1 nA and 1.05 A."
-            )
+        limit = self._maximum_current
+        check_range(value, -limit, limit, "current compliance", " A")
+        self.write(f":SENS:CURR:PROT:LEV {value}")
 
-    def within_current_compliance(self):
-        """Queries if the measured current is within the set compliance.
+    @property
+    def voltage_compliance(self):
+        """Returns the voltage the source will not be allowed to exceed, in volts."""
+        return self.query_float(":SENS:VOLT:PROT:LEV?")
 
-        :returns: boolean"""
-        response = self._instrument.query("SENS:CURR:PROT:TRIP?").strip()
-        return not bool(int(response))
+    @voltage_compliance.setter
+    def voltage_compliance(self, value):
+        limit = self._maximum_voltage
+        check_range(value, -limit, limit, "voltage compliance", " V")
+        self.write(f":SENS:VOLT:PROT:LEV {value}")
 
-    # Output configuration
+    @property
+    def in_current_compliance(self):
+        """Returns True while the source is clamped by the current compliance limit."""
+        return self.query_boolean(":SENS:CURR:PROT:TRIP?")
+
+    @property
+    def in_voltage_compliance(self):
+        """Returns True while the source is clamped by the voltage compliance limit."""
+        return self.query_boolean(":SENS:VOLT:PROT:TRIP?")
+
+    @property
+    def in_compliance(self):
+        """Returns True while the source is clamped by either compliance limit.
+
+        A reading taken in compliance is not the measurement that was asked
+        for, so this is worth checking before trusting one.
+        """
+        return self.in_current_compliance or self.in_voltage_compliance
+
+    def measure_range(self, function):
+        """Returns the measurement range of one function, in its own units."""
+        code = check_choice(function, MEASURE_FUNCTIONS, "measure function")
+        return self.query_float(f":SENS:{code}:RANG?")
+
+    def set_measure_range(self, function, value):
+        """Set one function's measurement range, turning its autorange off."""
+        code = check_choice(function, MEASURE_FUNCTIONS, "measure function")
+        self.write(f":SENS:{code}:RANG {value}")
+
+    def measure_auto_range(self, function):
+        """Returns whether one measure function picks its own range."""
+        code = check_choice(function, MEASURE_FUNCTIONS, "measure function")
+        return self.query_boolean(f":SENS:{code}:RANG:AUTO?")
+
+    def set_measure_auto_range(self, function, value):
+        """Turn autoranging on or off for one measure function."""
+        code = check_choice(function, MEASURE_FUNCTIONS, "measure function")
+        state = check_boolean(value, "measure autorange")
+        self.write(f":SENS:{code}:RANG:AUTO {int(state)}")
+
+    def integration_time(self, function):
+        """Integration time of one function, in power line cycles."""
+        code = check_choice(function, MEASURE_FUNCTIONS, "measure function")
+        return self.query_float(f":SENS:{code}:NPLC?")
+
+    def set_integration_time(self, function, cycles):
+        """Set one function's integration time, in power line cycles.
+
+        Longer is quieter: 0.01 is the fastest and noisiest setting, 10 the
+        slowest and quietest. One cycle is the default.
+        """
+        code = check_choice(function, MEASURE_FUNCTIONS, "measure function")
+        check_range(cycles, 0.01, 10, "integration time", " power line cycles")
+        self.write(f":SENS:{code}:NPLC {cycles}")
+
+    @property
+    def four_wire_sense(self):
+        """Returns whether remote (4-wire) sensing is used instead of 2-wire."""
+        return self.query_boolean(":SYST:RSEN?")
+
+    @four_wire_sense.setter
+    def four_wire_sense(self, value):
+        state = check_boolean(value, "four wire sense")
+        self.write(f":SYST:RSEN {int(state)}")
+
+    @property
+    def resistance_mode(self):
+        """Returns whether resistance ranging is 'auto' or 'manual'."""
+        reply = self.query(":SENS:RES:MODE?").strip().upper()
+        return "auto" if reply.startswith("AUTO") else "manual"
+
+    @resistance_mode.setter
+    def resistance_mode(self, value):
+        code = check_choice(value, {"auto": "AUTO", "manual": "MAN"}, "resistance mode")
+        self.write(f":SENS:RES:MODE {code}")
+
+    @property
+    def offset_compensated_resistance(self):
+        """Returns whether offset-compensated ohms is on, which cancels thermal EMFs."""
+        return self.query_boolean(":SENS:RES:OCOM?")
+
+    @offset_compensated_resistance.setter
+    def offset_compensated_resistance(self, value):
+        state = check_boolean(value, "offset compensated resistance")
+        self.write(f":SENS:RES:OCOM {int(state)}")
+
+    @property
+    def auto_zero(self):
+        """Returns whether the instrument re-zeros its A/D before every reading.
+
+        Accepts 'once' as well as on and off, to force a single update.
+        """
+        return self.query_boolean(":SYST:AZER:STAT?")
+
+    @auto_zero.setter
+    def auto_zero(self, value):
+        if str(value).strip().lower() == "once":
+            self.write(":SYST:AZER:STAT ONCE")
+            return
+        state = check_boolean(value, "auto zero")
+        self.write(f":SYST:AZER:STAT {int(state)}")
+
+    # Averaging filter
+
+    @property
+    def filter_enabled(self):
+        """Returns whether the averaging filter is on."""
+        return self.query_boolean(":SENS:AVER:STAT?")
+
+    @filter_enabled.setter
+    def filter_enabled(self, value):
+        state = check_boolean(value, "filter")
+        self.write(f":SENS:AVER:STAT {int(state)}")
+
+    @property
+    def filter_count(self):
+        """Returns how many readings the averaging filter combines."""
+        return self.query_integer(":SENS:AVER:COUN?")
+
+    @filter_count.setter
+    def filter_count(self, value):
+        count = check_integer_range(value, 1, 100, "filter count")
+        self.write(f":SENS:AVER:COUN {count}")
+
+    @property
+    def filter_type(self):
+        """Returns the averaging filter type: 'moving' or 'repeating'."""
+        reply = self.query(":SENS:AVER:TCON?").strip().upper()
+        return "moving" if reply.startswith("MOV") else "repeating"
+
+    @filter_type.setter
+    def filter_type(self, value):
+        code = check_choice(value, FILTER_TYPES, "filter type")
+        self.write(f":SENS:AVER:TCON {code}")
+
+    def enable_filter(self, count=10, filter_type="repeating"):
+        """Turn on averaging with a given count and type, in one call."""
+        self.filter_type = filter_type
+        self.filter_count = count
+        self.filter_enabled = True
+
+    def disable_filter(self):
+        """Turn the averaging filter off."""
+        self.filter_enabled = False
+
+    # Output
 
     @property
     def output(self):
-        """Gets or sets the source output of the Keithley 2400.
-
-        Expected input: boolean
-
-        :returns: boolean"""
-        output = {"0": False, "1": True}
-        response = self._instrument.query("OUTP?").strip()
-        return output[response]
+        """Returns whether the output terminals are live."""
+        return self.query_boolean(":OUTP:STAT?")
 
     @output.setter
     def output(self, value):
-        if value:
-            self._instrument.write("OUTP ON")
-        else:
-            self._instrument.write("OUTP OFF")
+        state = check_boolean(value, "output")
+        self.write(f":OUTP:STAT {int(state)}")
 
     @property
     def output_off_mode(self):
-        """Gets or sets the output mode when the output is off.
+        """Returns what the output does when off.
 
-        Expected input strings: 'himp', 'normal', 'zero', 'guard'
-
-        :returns: description of the output's off mode"""
-        modes = {
-            "HIMP": "high impedance",
-            "NORM": "normal",
-            "ZERO": "zero",
-            "GUAR": "guard",
-        }
-        response = self._instrument.query("OUTP:SMOD?").strip()
-        return modes[response]
+        'high impedance' opens the output relay, 'normal' holds 0 V with
+        compliance in effect, 'zero' sources 0 V, and 'guard' is a current
+        source configuration. The 2410 defaults to 'guard'.
+        """
+        reply = self.query(":OUTP:SMOD?").strip().upper()
+        for name, code in OUTPUT_OFF_MODES.items():
+            if reply.startswith(code):
+                return name
+        return reply
 
     @output_off_mode.setter
     def output_off_mode(self, value):
-        modes = {
-            "high impedance": "HIMP",
-            "himp": "HIMP",
-            "normal": "NORM",
-            "norm": "NORM",
-            "zero": "ZERO",
-            "0": "ZERO",
-            "guard": "GUARD",
-        }
-        self._instrument.write("OUTP:SMOD {}".format(modes[value.lower()]))
+        code = check_choice(value, OUTPUT_OFF_MODES, "output off mode")
+        self.write(f":OUTP:SMOD {code}")
 
-    # Data acquisition
+    def ramp_to(self, target, steps=100, delay=0.05):
+        """Walk the source to a level in steps rather than jumping to it.
 
-    def read(self, *measurements):
+        Stepping avoids the transient a sudden change puts through a device,
+        which matters for anything fragile on the end of the probes.
+
+        :param target: Level to finish at, in amps or volts.
+        :param steps: How many intermediate levels to pass through.
+        :param delay: Seconds to wait at each step.
         """
+        steps = check_integer_range(steps, 1, 100000, "number of steps")
+        check_range(delay, 0, 3600, "step delay", " s")
+        function = self.source_function
+        limit = self._source_limit(function)
+        target = check_range(
+            target,
+            -limit,
+            limit,
+            f"{function} source level",
+            self._source_unit(function),
+        )
 
-        Reads data from the Keithley 2400. Equivalent to the command :INIT; :FETCH?
+        start = self.source_value
+        for step in range(1, steps + 1):
+            self.source_value = start + (target - start) * step / steps
+            time.sleep(delay)
 
-        Multiple string arguments may be used. For example::
-
-            keithley.F('voltage', 'current')
-            keithley.read('time')
-
-        The first line returns a list in the form [voltage, current] and the second line
-        returns a list in the form [time].
-
-        Note: The returned lists contains the values in the order that you requested.
-
-        :param str *measurements: Any number of arguments that are from: 'voltage', 'current', 'resistance', 'time'
-        :return list measure_list: A list of the arithmetic means in the order of the given arguments
-        :return list measure_stdev_list: A list of the standard deviations (if more than 1 measurement) in the order
-            of the given arguments
-        """
-        response = self._instrument.query("read?").strip().split(",")
-        response = [float(x) for x in response]
-        read_types = {"voltage": 0, "current": 1, "resistance": 2, "time": 3}
-
-        measure_list = []
-        measure_stdev_list = []
-
-        for measurement in measurements:
-            samples = response[read_types[measurement] :: 5]
-            measure_list.append(mean(samples))
-            if len(samples) > 1:
-                measure_stdev_list.append(stdev(samples))
-
-        return measure_list, measure_stdev_list
-
-    def read_res(self):
-        response = self._instrument.query("MEAS?").strip().split(",")[2]
-        return float(response)
-
-    # Trigger functions
+    # Taking readings
 
     @property
-    def trace_delay(self):
-        """The amount of time the SourceMeter waits after the trigger to perform Device Action."""
-        return float(self._instrument.query("trigger:delay?").strip())
+    def data_elements(self):
+        """Returns which fields a reading returns, as a list of names."""
+        fields = [
+            field.strip() for field in self.query(":FORM:ELEM?").upper().split(",")
+        ]
+        return [name for name, code in DATA_ELEMENTS.items() if code in fields]
 
-    @trace_delay.setter
-    def trace_delay(self, delay):
-        if isinstance(delay, float) or isinstance(delay, int):
-            if 0.0 <= delay <= 999.9999:
-                self._instrument.write("trigger:delay {}".format(delay))
-            else:
-                raise RuntimeError(
-                    "Expected delay to be between 0.0 and 999.9999 seconds."
-                )
-        else:
-            raise RuntimeError("Expected delay to be an int or float.")
-
-    @property
-    def trigger(self):
-        """Gets or sets the type of trigger to be used.
-
-        Expected strings for setting: 'immediate', 'tlink', 'timer', 'manual', 'bus',
-        'nst', 'pst', 'bst' (see source code for other possibilities)"""
-        triggers = {
-            "IMM": "immediate",
-            "TLIN": "trigger link",
-            "TIM": "timer",
-            "MAN": "manual",
-            "BUS": "bus trigger",
-            "NST": "low SOT pulse",
-            "PST": "high SOT pulse",
-            "BST": "high or low SOT pulse",
-        }
-        return triggers[self._instrument.query("trigger:source?")]
-
-    @trigger.setter
-    def trigger(self, trigger):
-        triggers = {
-            "imm": "IMM",
-            "immediate": "IMM",
-            "tlin": "TLIN",
-            "tlink": "TLIN",
-            "trigger link": "TLIN",
-            "tim": "TIM",
-            "timer": "TIM",
-            "man": "MAN",
-            "manual": "MAN",
-            "bus": "BUS",
-            "bus trigger": "BUS",
-            "nst": "NST",
-            "low SOT pulse": "NST",
-            "pst": "PST",
-            "high SOT pulse": "PST",
-            "bst": "BST",
-            "high or low SOT pulse": "BST",
-        }
-        if trigger.lower() in triggers.keys():
-            self._instrument.query("trigger:source {}".format(trigger))
-        else:
-            raise RuntimeError(
-                "Unexpected trigger input. See documentation for details."
+    @data_elements.setter
+    def data_elements(self, values):
+        if isinstance(values, str):
+            values = [values]
+        codes = [check_choice(value, DATA_ELEMENTS, "data element") for value in values]
+        if not codes:
+            raise RangeError(
+                "At least one data element is needed. Choose from "
+                f"{', '.join(sorted(DATA_ELEMENTS))}."
             )
+        self.write(":FORM:ELEM " + ",".join(codes))
+
+    def read(self, *elements):
+        """Trigger a measurement and return it.
+
+        :param elements: Which fields to return, e.g. 'voltage', 'current'.
+                         Sets the data elements first. With none given, returns
+                         whatever the instrument is already configured to send.
+        :return: A list of floats, one per element.
+        """
+        if elements:
+            self.data_elements = list(elements)
+        return self.query_floats(":READ?")
+
+    def fetch(self):
+        """Return the last reading again, without triggering a new one."""
+        return self.query_floats(":FETC?")
+
+    def measure(self, function):
+        """Configure for one function, trigger, and return the reading."""
+        code = check_choice(function, MEASURE_FUNCTIONS, "measure function")
+        return self.query_floats(f":MEAS:{code}?")
+
+    def initiate(self):
+        """Start the configured source-measure cycle."""
+        self.write(":INIT")
+
+    def abort(self):
+        """Stop the source-measure cycle and return to idle."""
+        self.write(":ABOR")
+
+    # Buffer
+
+    @property
+    def buffer_size(self):
+        """Returns how many readings the buffer will hold."""
+        return self.query_integer(":TRAC:POIN?")
+
+    @buffer_size.setter
+    def buffer_size(self, value):
+        points = check_integer_range(
+            value, 1, MAXIMUM_BUFFER_POINTS, "buffer size", " readings"
+        )
+        self.write(f":TRAC:POIN {points}")
+
+    @property
+    def buffer_count(self):
+        """Returns how many readings are in the buffer now."""
+        return self.query_integer(":TRAC:POIN:ACT?")
+
+    @property
+    def buffer_source(self):
+        """Returns where buffered readings come from."""
+        reply = self.query(":TRAC:FEED?").strip().upper()
+        for name, code in BUFFER_SOURCES.items():
+            if reply.startswith(code):
+                return name
+        return reply
+
+    @buffer_source.setter
+    def buffer_source(self, value):
+        code = check_choice(value, BUFFER_SOURCES, "buffer source")
+        self.write(f":TRAC:FEED {code}")
+
+    @property
+    def buffer_control(self):
+        """Returns whether the buffer is filling ('next') or idle ('never')."""
+        reply = self.query(":TRAC:FEED:CONT?").strip().upper()
+        return "next" if reply.startswith("NEXT") else "never"
+
+    @buffer_control.setter
+    def buffer_control(self, value):
+        code = check_choice(value, BUFFER_CONTROLS, "buffer control")
+        self.write(f":TRAC:FEED:CONT {code}")
+
+    @property
+    def buffer_free(self):
+        """Returns the bytes available and bytes in use in the buffer, as a pair."""
+        return self.query_floats(":TRAC:FREE?")
+
+    @property
+    def timestamp_format(self):
+        """Returns whether buffer timestamps are 'absolute' or 'delta'."""
+        reply = self.query(":TRAC:TST:FORM?").strip().upper()
+        return "absolute" if reply.startswith("ABS") else "delta"
+
+    @timestamp_format.setter
+    def timestamp_format(self, value):
+        code = check_choice(value, TIMESTAMP_FORMATS, "timestamp format")
+        self.write(f":TRAC:TST:FORM {code}")
+
+    def read_buffer(self):
+        """Return everything stored in the buffer, as a list of floats."""
+        return self.query_floats(":TRAC:DATA?")
+
+    def clear_buffer(self):
+        """Discard the buffer contents."""
+        self.write(":TRAC:CLE")
+
+    def start_buffer(self, size=None):
+        """Clear the buffer, size it, and arm it to fill.
+
+        :param size: Number of readings to store. Left alone if not given.
+        """
+        self.clear_buffer()
+        if size is not None:
+            self.buffer_size = size
+        self.buffer_control = "next"
+
+    # Triggering
 
     @property
     def trigger_count(self):
-        """Gets or sets the number of triggers
-
-        Expected integer value range: 1 <= n <= 2500"""
-        return float(self._instrument.query("trigger:count?").strip())
+        """Returns how many measurements one arm cycle takes."""
+        return self.query_integer(":TRIG:COUN?")
 
     @trigger_count.setter
-    def trigger_count(self, num_triggers):
-        if isinstance(num_triggers, int):
-            if 1 <= num_triggers <= 2500:
-                self._instrument.write("trigger:count {}".format(num_triggers))
-            else:
-                raise RuntimeError("Trigger count expected to be between 1 and 2500.")
-        else:
-            raise RuntimeError("Trigger count expected to be type int.")
-
-    def initiate_cycle(self):
-        """Initiates source or measure cycle, taking the SourceMeter out of an idle state."""
-        self._instrument.write("initiate")
-
-    def abort_cycle(self):
-        """Aborts the source or measure cycle, bringing the SourceMeter back into an idle state."""
-        self._instrument.write("abort")
-
-    # Data storage / Buffer functions
-
-    # Note: :trace:data? and :read? are two separate buffers of
-    # maximum size 2500 readings.
+    def trigger_count(self, value):
+        count = check_integer_range(value, 1, MAXIMUM_BUFFER_POINTS, "trigger count")
+        self.write(f":TRIG:COUN {count}")
 
     @property
-    def num_readings_in_buffer(self):
-        """Gets the number of readings that are stored in the buffer."""
-        return int(self._instrument.query("trace:points:actual?").strip())
+    def trigger_delay(self):
+        """Returns the delay between the trigger and the measurement, in seconds."""
+        return self.query_float(":TRIG:DEL?")
+
+    @trigger_delay.setter
+    def trigger_delay(self, value):
+        check_range(value, 0, 999.9999, "trigger delay", " s")
+        self.write(f":TRIG:DEL {value}")
 
     @property
-    def trace_points(self):
-        """Gets or sets the size of the buffer
+    def trigger_source(self):
+        """Returns what advances the trigger layer: 'immediate' or 'trigger link'."""
+        reply = self.query(":TRIG:SOUR?").strip().upper()
+        return "trigger link" if reply.startswith("TLIN") else "immediate"
 
-        Expected integer value range: 1 <= n <= 2500"""
-        return int(self._instrument.query("trace:points?").strip())
+    @trigger_source.setter
+    def trigger_source(self, value):
+        code = check_choice(value, TRIGGER_SOURCES, "trigger source")
+        self.write(f":TRIG:SOUR {code}")
 
-    @trace_points.setter
-    def trace_points(self, num_points):
-        if isinstance(num_points, int):
-            if 1 <= num_points <= 2500:
-                self._instrument.write("trace:points {}".format(num_points))
-            else:
-                raise RuntimeError(
-                    "Keithley 2400 SourceMeter may only have 1 to 2500 buffer points."
-                )
-        else:
-            raise RuntimeError("Expected type of num_points: int.")
+    @property
+    def arm_count(self):
+        """Returns how many times the arm layer repeats."""
+        return self.query_integer(":ARM:COUN?")
 
-    def trace_feed_source(self, value):
-        """Sets the source of the trace feed.
+    @arm_count.setter
+    def arm_count(self, value):
+        if str(value).strip().lower() in ("inf", "infinite"):
+            self.write(":ARM:COUN INF")
+            return
+        count = check_integer_range(value, 1, MAXIMUM_BUFFER_POINTS, "arm count")
+        self.write(f":ARM:COUN {count}")
 
-        Expected strings: 'sense', 'calculate1', 'calculate2'"""
-        if value in ("sense", "calculate1", "calculate2"):
-            self._instrument.write("trace:feed {}".format(value))
-        else:
-            raise RuntimeError(
-                "Unexpected trace source type. See documentation for details."
-            )
+    @property
+    def arm_source(self):
+        """Returns what advances the arm layer."""
+        reply = self.query(":ARM:SOUR?").strip().upper()
+        for name, code in ARM_SOURCES.items():
+            if reply.startswith(code):
+                return name
+        return reply
 
-    def read_trace(self):
-        """Read contents of buffer."""
-        trace = self._instrument.query("trace:data?").strip().split(",")
-        trace_list = [float(x) for x in trace]
-        return trace_list
+    @arm_source.setter
+    def arm_source(self, value):
+        code = check_choice(value, ARM_SOURCES, "arm source")
+        self.write(f":ARM:SOUR {code}")
 
-    def clear_trace(self):
-        """Clear the buffer."""
-        self._instrument.query("trace:clear")
+    @property
+    def arm_timer(self):
+        """Returns the interval of the arm layer's timer source, in seconds."""
+        return self.query_float(":ARM:TIM?")
 
-    def buffer_memory_status(self):
-        """Check buffer memory status."""
-        response = self._instrument.query("trace:free?")
-        return response
+    @arm_timer.setter
+    def arm_timer(self, value):
+        check_range(value, 0.001, 99999.99, "arm timer interval", " s")
+        self.write(f":ARM:TIM {value}")
 
-    def fill_buffer(self):
-        """Fill buffer and stop."""
-        self._instrument.write("trace:feed:control next")
-
-    def disable_buffer(self):
-        """Disables the buffer."""
-        self._instrument.write("trace:feed:control never")
-
-    # Sweeping
-
-    # TODO: implement these!!!
-
-    # @property
-    # def sweep_start(self):
-    # """To be implemented."""
-    # pass
-
-    # @sweep_start.setter
-    # def sweep_start(self, start):
-    # pass
-
-    # @property
-    # def sweep_end(self):
-    # """To be implemented."""
-    # pass
-
-    # @sweep_end.setter
-    # def sweep_end(self, end):
-    # pass
-
-    # @property
-    # def sweep_center(self):
-    # """To be implemented."""
-    # pass
-
-    # @sweep_center.setter
-    # def sweep_center(self, center):
-    # pass
-
-    # @property
-    # def sweep_span(self):
-    # """To be implemented."""
-    # pass
-
-    # @sweep_span.setter
-    # def sweep_span(self, span):
-    # pass
-
-    # @property
-    # def sweep_ranging(self):
-    # """To be implemented."""
-    # pass
-
-    # @sweep_ranging.setter
-    # def sweep_ranging(self, _range):
-    # pass
-
-    # @property
-    # def sweep_scale(self):
-    # """To be implemented."""
-    # pass
-
-    # @sweep_scale.setter
-    # def sweep_scale(self, scale):
-    # pass
-
-    # @property
-    # def sweep_points(self):
-    # """To be implemented."""
-    # pass
-
-    # @sweep_points.setter
-    # def sweep_points(self, num_points):
-    # pass
-
-    # @property
-    # def sweep_direction(self):
-    # """To be implemented."""
-    # pass
-
-    # @sweep_direction.setter
-    # def sweep_direction(self, direction):
-    # pass
-
-    # # Ramping commands
-
-    def rampOutput(self, rampStart, rampTarget, step, timeStep=50e-3):
-        """Ramp the output smoothly from one value to another.
-
-        Arguments:
-            rampStart  : The starting value for the output ramp, in volts or amps.
-            rampTarget : The ending value for the output ramp, in volts or amps.
-           [nSteps]    : Optional. The number of steps in the ramp.
-           [timeStep]  : Optional. The time in seconds between each step in the ramp.
-
-        Returns:
-            sourceValue : The output value currently being sourced as a result of the ramp.
-        """
-
-        source = self.source_type  # either 'voltage' or 'current'
-
-        try:
-            nSteps = abs(np.ceil((rampStart - rampTarget) / step))
-        except ZeroDivisionError:
-            nSteps = 1
-
-        for sourceValue in np.linspace(rampStart, rampTarget, nSteps):
-            self.setSourceDC(source, sourceValue)
-            time.sleep(timeStep)
-
-    # starting with the output off, turn the output on then ramp the output up/down to a specified level
-    def rampOutputOn(self, rampTarget, step, timeStep=50e-3):
-        rampStart = 0
-        self.output = True
-        sourceValue = self.rampOutput(rampStart, rampTarget, step, timeStep)
-        return sourceValue
-
-    # starting with the output on, ramp the output to 0, then turn the output off
-    def rampOutputOff(self, rampStart, step, timeStep=50e-3):
-        rampTarget = 0
-        sourceValue = self.rampOutput(self.output, rampTarget, step, timeStep)
-        self.output = False
-        return sourceValue
-
-    # Common commands
-
-    def clear_status(self):
-        """Clears all event registers and Error Queue."""
-        self._instrument.write("*cls")
-
-    def reset_to_defaults(self):
-        """Resets to defaults of Sourcemeter."""
-        self._instrument.write("*rst")
-
-    def identify(self):
-        """Returns manufacturer, model number, serial number, and firmware revision levels."""
-        response = self._instrument.write("*idn?")
-        return {
-            "manufacturer": response[0],
-            "model": response[1],
-            "serial number": response[2],
-            "firmware revision level": response[3],
-        }
+    def clear_trigger(self):
+        """Return the trigger system to idle."""
+        self.write(":TRIG:CLE")
 
     def send_bus_trigger(self):
-        """Sends a bus trigger to SourceMeter."""
-        self._instrument.write("*trg")
+        """Send a bus trigger (``*TRG``)."""
+        self.write("*TRG")
+
+    # Sweeps
+
+    @property
+    def sweep_start(self):
+        """Returns the first level of a sweep, in the active source's units."""
+        return self.query_float(f":SOUR:{self._active_source_code()}:STAR?")
+
+    @sweep_start.setter
+    def sweep_start(self, value):
+        function = self.source_function
+        limit = self._source_limit(function)
+        check_range(
+            value, -limit, limit, "sweep start level", self._source_unit(function)
+        )
+        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:STAR {value}")
+
+    @property
+    def sweep_stop(self):
+        """Returns the last level of a sweep, in the active source's units."""
+        return self.query_float(f":SOUR:{self._active_source_code()}:STOP?")
+
+    @sweep_stop.setter
+    def sweep_stop(self, value):
+        function = self.source_function
+        limit = self._source_limit(function)
+        check_range(
+            value, -limit, limit, "sweep stop level", self._source_unit(function)
+        )
+        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:STOP {value}")
+
+    @property
+    def sweep_step(self):
+        """Returns the step size of a linear sweep, in the active source's units."""
+        return self.query_float(f":SOUR:{self._active_source_code()}:STEP?")
+
+    @sweep_step.setter
+    def sweep_step(self, value):
+        function = self.source_function
+        limit = self._source_limit(function)
+        check_range(
+            value, -limit, limit, "sweep step size", self._source_unit(function)
+        )
+        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:STEP {value}")
+
+    @property
+    def sweep_points(self):
+        """Returns how many points a sweep contains."""
+        return self.query_integer(":SOUR:SWE:POIN?")
+
+    @sweep_points.setter
+    def sweep_points(self, value):
+        points = check_integer_range(value, 1, MAXIMUM_BUFFER_POINTS, "sweep points")
+        self.write(f":SOUR:SWE:POIN {points}")
+
+    @property
+    def sweep_spacing(self):
+        """Returns whether sweep points are spaced 'linear' or 'logarithmic'."""
+        reply = self.query(":SOUR:SWE:SPAC?").strip().upper()
+        return "logarithmic" if reply.startswith("LOG") else "linear"
+
+    @sweep_spacing.setter
+    def sweep_spacing(self, value):
+        code = check_choice(value, SWEEP_SPACINGS, "sweep spacing")
+        self.write(f":SOUR:SWE:SPAC {code}")
+
+    @property
+    def sweep_direction(self):
+        """Returns whether the sweep runs 'up' from start or 'down' from stop."""
+        reply = self.query(":SOUR:SWE:DIR?").strip().upper()
+        return "down" if reply.startswith("DOWN") else "up"
+
+    @sweep_direction.setter
+    def sweep_direction(self, value):
+        code = check_choice(value, SWEEP_DIRECTIONS, "sweep direction")
+        self.write(f":SOUR:SWE:DIR {code}")
+
+    @property
+    def sweep_ranging(self):
+        """Returns how the source ranges during a sweep: 'best', 'auto' or 'fixed'."""
+        reply = self.query(":SOUR:SWE:RANG?").strip().upper()
+        for name, code in SWEEP_RANGINGS.items():
+            if reply.startswith(code):
+                return name
+        return reply
+
+    @sweep_ranging.setter
+    def sweep_ranging(self, value):
+        code = check_choice(value, SWEEP_RANGINGS, "sweep ranging")
+        self.write(f":SOUR:SWE:RANG {code}")
+
+    def configure_sweep(
+        self,
+        start,
+        stop,
+        points=None,
+        step=None,
+        spacing="linear",
+        direction="up",
+        ranging="best",
+    ):
+        """Set up a staircase sweep of the active source.
+
+        Give either ``points`` or ``step``, not both. The trigger count is set
+        to match the number of points, so one initiate() runs the whole sweep.
+
+        :param start: First source level.
+        :param stop: Last source level.
+        :param points: Number of points in the sweep.
+        :param step: Size of each step, as an alternative to points.
+        :return: The number of points the sweep will produce.
+        """
+        if (points is None) == (step is None):
+            raise RangeError("A sweep needs either points= or step=, but not both.")
+
+        self.source_mode = "sweep"
+        self.sweep_start = start
+        self.sweep_stop = stop
+        self.sweep_spacing = spacing
+        self.sweep_direction = direction
+        self.sweep_ranging = ranging
+
+        if step is not None:
+            if float(step) == 0:
+                raise RangeError("The sweep step size cannot be zero.")
+            self.sweep_step = step
+            points = int(abs((float(stop) - float(start)) / float(step))) + 1
+        else:
+            self.sweep_points = points
+
+        self.trigger_count = points
+        return points
+
+    def configure_list_sweep(self, levels):
+        """Sweep through an explicit list of source levels.
+
+        :param levels: The levels to output, in order. Up to 100 of them.
+        :return: How many levels were configured.
+        """
+        levels = list(levels)
+        if not 1 <= len(levels) <= 100:
+            raise RangeError(
+                f"A list sweep takes between 1 and 100 levels, but got {len(levels)}."
+            )
+        function = self.source_function
+        limit = self._source_limit(function)
+        for level in levels:
+            check_range(
+                level, -limit, limit, "list sweep level", self._source_unit(function)
+            )
+        self.source_mode = "list"
+        self.write(
+            f":SOUR:LIST:{SOURCE_FUNCTIONS[function]} "
+            + ",".join(str(level) for level in levels)
+        )
+        self.trigger_count = len(levels)
+        return len(levels)
+
+    # Math, limit tests and statistics
+
+    @property
+    def math_expression(self):
+        """Returns the name of the CALC1 math expression in use."""
+        return self.query(":CALC:MATH:NAME?").strip().strip('"')
+
+    @math_expression.setter
+    def math_expression(self, value):
+        self.write(f':CALC:MATH:NAME "{value}"')
+
+    @property
+    def math_enabled(self):
+        """Returns whether the CALC1 math expression is applied to readings."""
+        return self.query_boolean(":CALC:STAT?")
+
+    @math_enabled.setter
+    def math_enabled(self, value):
+        state = check_boolean(value, "math")
+        self.write(f":CALC:STAT {int(state)}")
+
+    def math_data(self):
+        """Return the result of the CALC1 math expression."""
+        return self.query_floats(":CALC:DATA?")
+
+    def available_math_expressions(self):
+        """List the math expression names the instrument knows."""
+        reply = self.query(":CALC:MATH:CAT?")
+        return [name.strip().strip('"') for name in reply.split(",") if name.strip()]
+
+    def set_limit_test(self, number, lower, upper, enabled=True):
+        """Configure one of the CALC2 limit tests.
+
+        :param number: Which limit test, 1 to 12.
+        :param lower: Lower bound a reading must stay above to pass.
+        :param upper: Upper bound a reading must stay below to pass.
+        """
+        limit = check_integer_range(number, 1, 12, "limit test number")
+        check_range(lower, -9.999999e20, 9.999999e20, "limit lower bound")
+        check_range(upper, -9.999999e20, 9.999999e20, "limit upper bound")
+        if float(lower) > float(upper):
+            raise RangeError(
+                f"The limit lower bound ({lower}) must not be above the upper "
+                f"bound ({upper})."
+            )
+        state = check_boolean(enabled, "limit test")
+        self.write(f":CALC2:LIM{limit}:LOW:DATA {lower}")
+        self.write(f":CALC2:LIM{limit}:UPP:DATA {upper}")
+        self.write(f":CALC2:LIM{limit}:STAT {int(state)}")
+
+    def limit_test_failed(self, number):
+        """Whether a limit test's most recent reading failed."""
+        limit = check_integer_range(number, 1, 12, "limit test number")
+        return self.query_boolean(f":CALC2:LIM{limit}:FAIL?")
+
+    def statistic(self, name):
+        """Return a statistic over the readings in the buffer.
+
+        :param name: 'mean', 'standard deviation', 'maximum', 'minimum' or
+                     'peak to peak'.
+        """
+        code = check_choice(name, STATISTICS, "statistic")
+        self.write(f":CALC3:FORM {code}")
+        return self.query_floats(":CALC3:DATA?")
+
+    # Front panel
+    #
+    # These allow the instrument to be driven exactly as if someone were
+    # standing in front of it, which is useful for demonstrating a procedure or
+    # for leaving a message on the display during a long unattended run.
+
+    @property
+    def display_enabled(self):
+        """Returns whether the front-panel display is on.
+
+        Turning it off makes the instrument measurably faster, because it stops
+        refreshing the display between readings.
+        """
+        return self.query_boolean(":DISP:ENAB?")
+
+    @display_enabled.setter
+    def display_enabled(self, value):
+        state = check_boolean(value, "display")
+        self.write(f":DISP:ENAB {int(state)}")
+
+    @property
+    def display_digits(self):
+        """Returns how many digits the display shows, from 4 to 7."""
+        return self.query_integer(":DISP:DIG?")
+
+    @display_digits.setter
+    def display_digits(self, value):
+        digits = check_integer_range(value, 4, 7, "number of display digits")
+        self.write(f":DISP:DIG {digits}")
+
+    @property
+    def display_text(self):
+        """Returns the message shown on the top line of the display."""
+        return self.query(":DISP:WIND1:TEXT:DATA?").strip().strip('"')
+
+    @display_text.setter
+    def display_text(self, value):
+        text = str(value)
+        if len(text) > 20:
+            raise RangeError(
+                f"Display text is at most 20 characters, but got {len(text)}."
+            )
+        self.write(f':DISP:WIND1:TEXT:DATA "{text}"')
+        self.write(":DISP:WIND1:TEXT:STAT 1")
+
+    def clear_display_text(self):
+        """Stop showing a message and return the display to readings."""
+        self.write(":DISP:WIND1:TEXT:STAT 0")
+
+    def press_key(self, key):
+        """Press a front-panel key, by name or by code.
+
+        :param key: A name from FRONT_PANEL_KEYS, such as 'output' or
+                    'measure_voltage', or a code from 1 to 32.
+        """
+        if isinstance(key, str):
+            name = key.strip().lower().replace(" ", "_")
+            if name not in FRONT_PANEL_KEYS:
+                raise RangeError(
+                    f"'{key}' is not a front-panel key. Choose from "
+                    f"{', '.join(sorted(FRONT_PANEL_KEYS))}."
+                )
+            code = FRONT_PANEL_KEYS[name]
+        else:
+            code = check_integer_range(key, 1, 32, "front-panel key code")
+        self.write(f":SYST:KEY {code}")
+
+    @property
+    def last_key(self):
+        """Returns the code of the last key pressed, whether by hand or by press_key."""
+        return self.query_integer(":SYST:KEY?")
+
+    @property
+    def beeper_enabled(self):
+        """Returns whether the beeper will sound."""
+        return self.query_boolean(":SYST:BEEP:STAT?")
+
+    @beeper_enabled.setter
+    def beeper_enabled(self, value):
+        state = check_boolean(value, "beeper")
+        self.write(f":SYST:BEEP:STAT {int(state)}")
+
+    def beep(self, frequency=500, duration=1.0):
+        """Sound the beeper, to signal the end of a long measurement.
+
+        :param frequency: Tone in hertz, from 65 to 2000000.
+        :param duration: Length in seconds, from 0 to 7.9.
+        """
+        check_range(frequency, 65, 2000000, "beeper frequency", " Hz")
+        check_range(duration, 0, 7.9, "beeper duration", " s")
+        self.write(f":SYST:BEEP {frequency},{duration}")
+
+    def go_to_local(self):
+        """Return the instrument to front-panel control."""
+        self.write(":SYST:LOC")
+
+    def go_to_remote(self):
+        """Put the instrument under remote control."""
+        self.write(":SYST:REM")
+
+    def lock_front_panel(self):
+        """Put the instrument in remote with the LOCAL key disabled.
+
+        Stops anyone taking manual control part-way through a measurement.
+        """
+        self.write(":SYST:RWL")
+
+    # System
+
+    @property
+    def line_frequency(self):
+        """Returns the power line frequency the instrument synchronises to."""
+        return self.query_integer(":SYST:LFR?")
+
+    @line_frequency.setter
+    def line_frequency(self, value):
+        code = check_choice(value, {50: "50", 60: "60"}, "line frequency")
+        self.write(f":SYST:LFR {code}")
+
+    def preset(self):
+        """Return the instrument to its SYSTem:PRESet defaults."""
+        self.write(":SYST:PRES")
+
+    @property
+    def contact_check(self):
+        """Returns whether contact check is enabled, if this unit has the option."""
+        return self.query_boolean(":SYST:CCH?")
+
+    @contact_check.setter
+    def contact_check(self, value):
+        state = check_boolean(value, "contact check")
+        self.write(f":SYST:CCH {int(state)}")
+
+    @property
+    def contact_check_resistance(self):
+        """Returns the contact check threshold resistance, in ohms."""
+        return self.query_float(":SYST:CCH:RES?")
+
+    @contact_check_resistance.setter
+    def contact_check_resistance(self, value):
+        check_range(value, 0, 60, "contact check threshold resistance", " ohms")
+        self.write(f":SYST:CCH:RES {value}")
+
+    # Common procedures
+
+    def configure_source(self, function, level=0.0, compliance=None, measure=None):
+        """Set the instrument up as a source, in one call.
+
+        :param function: 'voltage' or 'current' to source.
+        :param level: Level to start at.
+        :param compliance: Limit on the quantity not being sourced. A voltage
+                           source is limited in current, and the other way
+                           round.
+        :param measure: What to measure, defaulting to both voltage and
+                        current.
+        """
+        code = check_choice(function, SOURCE_FUNCTIONS, "source function")
+        name = "current" if code == "CURR" else "voltage"
+
+        self.source_function = name
+        if compliance is not None:
+            if name == "current":
+                self.voltage_compliance = compliance
+            else:
+                self.current_compliance = compliance
+        self.measure_functions = ["voltage", "current"] if measure is None else measure
+        self.source_value = level
+
+    def sweep_source(
+        self,
+        start,
+        stop,
+        points=None,
+        step=None,
+        settle=0.0,
+        spacing="linear",
+        return_to_start=False,
+    ):
+        """Step the source through a range, reading at each point.
+
+        Runs the sweep from Python rather than using the instrument's own
+        staircase. That is slower, but the readings arrive one at a time, so a
+        measurement can be plotted, logged or stopped while it runs.
+
+            for level, voltage, current in source.sweep_source(0, 1, points=101):
+                print(level, voltage, current)
+
+        :param start: First source level.
+        :param stop: Last source level.
+        :param points: Number of levels, including both ends.
+        :param step: Spacing between levels, as an alternative to points.
+        :param settle: Seconds to wait after setting each level before reading.
+        :param spacing: 'linear' or 'logarithmic'.
+        :param return_to_start: Sweep back down again afterwards, for
+                                hysteresis.
+        :yield: A tuple of (source level, voltage, current) at each point.
+        """
+        levels = sweep_values(start, stop, points=points, step=step, spacing=spacing)
+        if return_to_start:
+            levels = round_trip(levels)
+
+        self.data_elements = ["voltage", "current"]
+        for level in levels:
+            self.source_value = level
+            if settle:
+                time.sleep(settle)
+            voltage, current = self.read()[:2]
+            yield level, voltage, current
+
+    def safe_shutdown(self, steps=50, delay=0.02):
+        """Walk the source down to zero, then switch the output off.
+
+        Opening the output while it is driving leaves whatever charge is on the
+        device to find its own way out. Ramping down first does not.
+        """
+        if self.output:
+            self.ramp_to(0.0, steps=steps, delay=delay)
+        self.output = False
+
+    def __repr__(self):
+        return f"Keithley{self._model}({self._transport!r})"

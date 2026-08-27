@@ -1,410 +1,558 @@
-"""Module containing a class to interface with a Keithley 2182 SMU
+"""Driver for the Keithley 2182 and 2182A nanovoltmeter.
 
-This module requires a National Instruments VISA driver, which can be found at
-https://www.ni.com/visa/
+The 2182 measures only: it has two voltage channels and no source of any kind.
+Channel 1 reads up to 120 V, channel 2 up to 12 V, and channel 0 is the internal
+temperature sensor. It is most often paired with a 6221 current source over the
+trigger link, where the 6221 drives the current and the 2182 reads the voltage.
 
-Attributes:
-    resource_manager: the pyvisa resource manager which provides the visa
-                      objects used for communicating over the GPIB interface
-
-    logger: a python logger object
-
-
-Classes:
-    keithley2400: a class for interfacing with a Keithley2400 SMU
-
+Commands and ranges are transcribed from the *Model 2182/2182A Nanovoltmeter
+User's Manual*, Tables 2-3, 3-3 and the SCPI reference in Appendix.
 """
 
-from math import ceil
-import os.path
+import math
+import statistics
 import time
-import logging
 
-import pandas as pd
-import visa
+from ..core import (
+    ScpiInstrument,
+    check_boolean,
+    check_choice,
+    check_integer_range,
+    check_range,
+)
+from ..core.errors import RangeError
 
-from numpy import linspace
-from pyvisa.errors import VisaIOError
+# Full-scale reading limits per channel, in volts.
+CHANNEL_VOLTAGE_LIMITS = {1: 120.0, 2: 12.0}
 
-DEFAULT_NUM_POINTS = 1  # number of data points to collect for each measurement
-DEFAULT_SAVE_PATH = "C://Data/pythonData/",
+# Integration rate limits depend on the power line frequency.
+NPLC_LIMITS = {50: (0.01, 50.0), 60: (0.01, 60.0)}
 
-# create a logger object for this module
-logger = logging.getLogger(__name__)
-# added so that log messages show up in Jupyter notebooks
-logger.addHandler(logging.StreamHandler())
+FUNCTIONS = {"voltage": "VOLTage", "temperature": "TEMPerature"}
+FILTER_TYPES = {"moving": "MOVing", "repeating": "REPeat"}
+TRIGGER_SOURCES = {
+    "immediate": "IMM",
+    "timer": "TIM",
+    "manual": "MAN",
+    "bus": "BUS",
+    "external": "EXT",
+}
+THERMOCOUPLE_TYPES = ("J", "K", "T", "E", "R", "S", "B", "N")
+TEMPERATURE_UNITS = {"celsius": "C", "fahrenheit": "F", "kelvin": "K"}
+STATISTICS = {
+    "mean": "MEAN",
+    "standard deviation": "SDEViation",
+    "maximum": "MAXimum",
+    "minimum": "MINimum",
+    "peak to peak": "PKPK",
+}
 
-try:
-    # the pyvisa manager we'll use to connect to the GPIB resources
-    resource_manager = visa.ResourceManager()
-except OSError:
-    logger.exception("\n\tCould not find the VISA library. Is the National Instruments VISA driver installed?\n\n")
+MAXIMUM_BUFFER_POINTS = 1024
 
 
-class Keithley2182():
-    """A class to interface with the Keithley 2400 sourcemeter
+class Keithley2182(ScpiInstrument):
+    """Interface to a Keithley 2182 or 2182A nanovoltmeter.
 
-    Args:
-        GPIBaddr (int): the GPIB address of the instrument
+    meter = Keithley2182(gpib_address=7)
+    meter.channel = 1
+    meter.integration_time = 5
+    meter.analog_filter = True
+    voltage = meter.read()
     """
 
-    def __init__(self, GPIBaddr):
-        """Create an instance of the keithley2400 class
+    IDENTIFIER = "2182"
 
-        Args:
-            GPIBaddr: The GPIB address of the instrument.
+    def __init__(self, *args, line_frequency=60, **kwargs):
+        super().__init__(*args, **kwargs)
+        if int(line_frequency) not in NPLC_LIMITS:
+            raise RangeError(
+                "The power line frequency can be 50 or 60 Hz, but got "
+                f"{line_frequency}."
+            )
+        self.line_frequency = int(line_frequency)
+
+    def _check_channel(self, channel, allow_internal=True):
+        """Validate a channel number, optionally allowing the internal sensor."""
+        lowest = 0 if allow_internal else 1
+        number = check_integer_range(channel, lowest, 2, "measurement channel")
+        return number
+
+    def _channel_path(self, channel):
+        """SCPI path fragment for a channel. Channel 1 is the default path."""
+        return "" if int(channel) == 1 else f":CHAN{int(channel)}"
+
+    # Function and channel
+
+    @property
+    def function(self):
+        """Returns what is being measured: 'voltage' or 'temperature'."""
+        reply = self.query(":SENS:FUNC?").strip().strip('"').strip("'").upper()
+        return "temperature" if reply.startswith("TEMP") else "voltage"
+
+    @function.setter
+    def function(self, value):
+        code = check_choice(value, FUNCTIONS, "measurement function")
+        self.write(f":SENS:FUNC '{code}'")
+
+    @property
+    def channel(self):
+        """Returns which input is measured: 1, 2, or 0 for the internal sensor."""
+        return self.query_integer(":SENS:CHAN?")
+
+    @channel.setter
+    def channel(self, value):
+        number = self._check_channel(value)
+        self.write(f":SENS:CHAN {number}")
+
+    # Range
+
+    def voltage_range(self, channel=1):
+        """Measurement range of one channel, in volts."""
+        number = self._check_channel(channel, allow_internal=False)
+        return self.query_float(f":SENS:VOLT{self._channel_path(number)}:RANG?")
+
+    def set_voltage_range(self, value, channel=1):
+        """Set one channel's range, which turns its autorange off.
+
+        Channel 1 reads to 120 V and channel 2 to 12 V.
         """
-        try:
-            self._visa_resource = resource_manager.open_resource("GPIB::%d" % GPIBaddr)
-            self._initialize()
-            #self._clearData()
+        number = self._check_channel(channel, allow_internal=False)
+        limit = CHANNEL_VOLTAGE_LIMITS[number]
+        check_range(value, -limit, limit, f"channel {number} voltage range", " V")
+        self.write(f":SENS:VOLT{self._channel_path(number)}:RANG {value}")
 
-            self.data = pd.DataFrame()
-     
-            # needed to trim the trailing '\n' from instrument responses
-            self._visa_resource.read_termination = '\n'
+    def voltage_auto_range(self, channel=1):
+        """Whether one channel picks its own range."""
+        number = self._check_channel(channel, allow_internal=False)
+        return self.query_boolean(f":SENS:VOLT{self._channel_path(number)}:RANG:AUTO?")
 
-            assert len(self._visa_resource.query("*IDN?")) > 0 , 'Instrument identification failed.'
+    def set_voltage_auto_range(self, value, channel=1):
+        """Turn autoranging on or off for one channel."""
+        number = self._check_channel(channel, allow_internal=False)
+        state = check_boolean(value, "voltage autorange")
+        self.write(f":SENS:VOLT{self._channel_path(number)}:RANG:AUTO {int(state)}")
 
-        except NameError:
-            error_msg = "\n\tCannot instantiate keithley6221 instance. Is the National Instruments VISA library installed?\n\n"
-            logger.exception(error_msg)
-            raise NameError
+    # Integration rate
 
-        except VisaIOError:
-            error_msg = "\n\tError communicating with the instrument. The Keithley should be in GPIB communication mode, is it in RS-232?\n\n"
-            logger.exception(error_msg)
+    @property
+    def integration_time(self):
+        """Returns the integration time, in power line cycles."""
+        return self.query_float(":SENS:VOLT:NPLC?")
 
-        #except Exception:
-         #   error_msg = ""
-          #  logger.exception(error_msg)
+    @integration_time.setter
+    def integration_time(self, value):
+        lowest, highest = NPLC_LIMITS[self.line_frequency]
+        check_range(
+            value,
+            lowest,
+            highest,
+            f"integration time at {self.line_frequency} Hz",
+            " power line cycles",
+        )
+        self.write(f":SENS:VOLT:NPLC {value}")
 
-    #####################################################################################################
-    # Internal methods: these are used internally but shouldn't be necessary for basic use of the class #
-    #####################################################################################################
+    @property
+    def aperture(self):
+        """Returns the integration time expressed in seconds instead of line cycles."""
+        return self.query_float(":SENS:VOLT:APER?")
 
-    # adapted from http://pyvisa.sourceforge.net/pyvisa.html#a-more-complex-example
-    def _initialize(self):
-        """Initialize the instrument to enable data readout."""
+    @aperture.setter
+    def aperture(self, value):
+        shortest = 166.67e-6 if self.line_frequency == 60 else 200e-6
+        check_range(value, shortest, 1.0, "aperture", " s")
+        self.write(f":SENS:VOLT:APER {value}")
 
-        self._visa_resource.write("*RST")
-        self._visa_resource.write(":INITIATE:CONTINUOUS ON;:ABORT")
-        self._visa_resource.write(":TRIGGER:SOURCE BUS")
-        self._visa_resource.write("SENSE:FUNCTION 'VOLTAGE:DC'")
-        self._visa_resource.write("SENSE:VOLTAGE:DC:RANGE:AUTO ON")
-        self._visa_resource.write("TRIGGER:COUNT: 1")
-        self._visa_resource.write("INITIATE")
+    # Filtering
+    #
+    # The 2182 has two filters: an analog low-pass ahead of the A/D, and a
+    # digital averaging filter after it. Nanovolt work usually wants both.
 
-    def _activateBuffer(self):
-        """Activate the instrument's internal data storage."""
+    def analog_filter(self, channel=1):
+        """Whether the analog low-pass filter is on for one channel."""
+        number = self._check_channel(channel, allow_internal=False)
+        return self.query_boolean(f":SENS:VOLT{self._channel_path(number)}:LPAS?")
 
-        self._visa_resource.write("TRACE:FEED:CONTROL NEXT")
+    def set_analog_filter(self, value, channel=1):
+        """Turn the analog low-pass filter on or off for one channel."""
+        number = self._check_channel(channel, allow_internal=False)
+        state = check_boolean(value, "analog filter")
+        self.write(f":SENS:VOLT{self._channel_path(number)}:LPAS {int(state)}")
 
-    def _deactivateBuffer(self):
-        """Clear the instrument's internal buffer, and reset status bytes
-        to prepare for a new measurement."""
+    def digital_filter(self, channel=1):
+        """Whether the digital averaging filter is on for one channel."""
+        number = self._check_channel(channel, allow_internal=False)
+        return self.query_boolean(f":SENS:VOLT{self._channel_path(number)}:DFIL:STAT?")
 
-        self._visa_resource.write("TRACE:FEED:CONTROL NEVER")
+    def set_digital_filter(
+        self, enabled=True, count=10, filter_type="moving", window=0.01, channel=1
+    ):
+        """Configure and enable the digital averaging filter.
 
-    def _pullData(self):
-        """Retrieve data from the instrument's internal buffer and store it in self.data."""
-
-        buffer_points = self._visa_resource.query_ascii_values("TRACE:POINTS:ACTUAL?")[0]
-        
-        if buffer_points > 0:
-
-	        self._activateBuffer()
-	        # returns (V, I, I/V, time, ?) for each data point in a flat list
-	        # I/V column is only meaningful if the instrument was configured to measure resistance
-	        dataList = self._visa_resource.query_ascii_values("TRACE:DATA?")
-	        dataDict = {'volts': dataList[0::5],
-	                    'amps': dataList[1::5],
-	                    'ohms': dataList[2::5],
-	                    'seconds': dataList[3::5]}
-	        dataDF = pd.DataFrame(dataDict)
-	
-	        self.data = self.data.append(dataDF)
-
-    def _clearData(self):
-        """Clear the data saved in the instrument's buffer."""
-
-        self._deactivateBuffer()
-        self._visa_resource.write("TRACE:CLEAR")
-        self._activateBuffer()
-
-    ##############################################################
-    # Configuration methods: use these to configure the instrument #
-    ##############################################################
-
-    def resetDefaults(self):
-        """Reset all parameters to default.
-        
-        Please see Keithley 2400 manual for all the SCPI commands.
-        Find the SCPI commands table, and look at the column named
-        'default' to find all the default parameters
-        
-        Examples of default parameters:
-            SCPI COMMAND                DEFAULT
-            ------------                -------
-            OUTPUT                      OFF
-            SENSe:CURRent:RANGe:AUTO    ON
-            SENSe:RESistance:MODE       AUTO
-            
+        :param count: How many readings to average, 1 to 100.
+        :param filter_type: 'moving' or 'repeating'.
+        :param window: Noise window as a percentage of range, 0 to 10. Readings
+                       outside the window restart the filter, so a step change
+                       is not smeared across the average.
+        :param channel: Which channel the setting applies to.
         """
-        self._visa_resource.write("*RST")
-        return None
+        number = self._check_channel(channel, allow_internal=False)
+        path = f":SENS:VOLT{self._channel_path(number)}:DFIL"
+        readings = check_integer_range(count, 1, 100, "filter count")
+        code = check_choice(filter_type, FILTER_TYPES, "filter type")
+        check_range(window, 0, 10, "filter window", " percent")
+        state = check_boolean(enabled, "digital filter")
 
-    
-    def setSourceDC(self, value=0):
-        """Configure the instrument to provide a constant output.
+        self.write(f"{path}:COUN {readings}")
+        self.write(f"{path}:TCON {code}")
+        self.write(f"{path}:WIND {window}")
+        self.write(f"{path}:STAT {int(state)}")
 
-        Arguments:
-            value  (float): The output value to source in amps.
+    # Relative (nulling)
+
+    def relative(self, channel=1):
+        """Whether the relative offset is applied on one channel."""
+        number = self._check_channel(channel, allow_internal=False)
+        return self.query_boolean(f":SENS:VOLT{self._channel_path(number)}:REF:STAT?")
+
+    def set_relative(self, value, channel=1):
+        """Set the relative offset subtracted from readings, in volts.
+
+        Channel 1 accepts -120 to 120 V, channel 2 -12 to 12 V.
         """
-        self._visa_resource.write("CURRENT:RANGE:AUTO ON")
-        self._visa_resource.write("CURRENT " + str(value))
+        number = self._check_channel(channel, allow_internal=False)
+        limit = CHANNEL_VOLTAGE_LIMITS[number]
+        check_range(value, -limit, limit, f"channel {number} relative value", " V")
+        self.write(f":SENS:VOLT{self._channel_path(number)}:REF {value}")
+        self.write(f":SENS:VOLT{self._channel_path(number)}:REF:STAT 1")
 
-    def setSourceSweep(self, source, startValue, stopValue, sourceStep):
-        """Configure the instrument to perform a sweep measurement.
+    def acquire_relative(self, channel=1):
+        """Take the present reading as the relative offset.
 
-        Arguments:
-            source (str)      : The type of output to source. One of ['voltage' | 'current'].
-            startValue (float): The output value to start the sweep at, in volts or amps.
-            stopValue  (float): The output value to stop the sweep at, in volts or amps.
-            sourceStep (float): The value by which to step the output, in volts or amps.
-
-        Returns:
-            (int)      : The number of data points to be collected.
+        This is how thermal EMFs are nulled: short the input, acquire, and
+        every later reading has that offset removed.
         """
+        number = self._check_channel(channel, allow_internal=False)
+        self.write(f":SENS:VOLT{self._channel_path(number)}:REF:ACQ")
+        self.write(f":SENS:VOLT{self._channel_path(number)}:REF:STAT 1")
 
-        # configure the instrument to record the appropriate number of points
-        numPts = ceil(abs((stopValue - startValue) / sourceStep)) + 1
-        self._visa_resource.write("TRIGGER:COUNT %d" % numPts)
-        self._visa_resource.write("TRACE:POINTS %d" % numPts)
+    def clear_relative(self, channel=1):
+        """Stop subtracting the relative offset."""
+        number = self._check_channel(channel, allow_internal=False)
+        self.write(f":SENS:VOLT{self._channel_path(number)}:REF:STAT 0")
 
-        if self.getMeasure() == 'RES':
-            self._visa_resource.write("SENSE:RESISTANCE:MODE MANUAL")
+    # Ratio and delta
 
-        if source.lower() == "voltage":
-            self._visa_resource.write("SOURCE:FUNCTION:MODE VOLTAGE")
-            self._visa_resource.write("SOURCE:VOLTAGE:MODE SWEEP")
-            self._visa_resource.write("SOURCE:VOLTAGE:RANGE " + str(stopValue))
-            self._visa_resource.write("SOURCE:VOLTAGE:START " + str(startValue))
-            self._visa_resource.write("SOURCE:VOLTAGE:STOP " + str(stopValue))
-            self._visa_resource.write("SOURCE:VOLTAGE:STEP " + str(sourceStep))
-        elif source.lower() == "current":
-            self._visa_resource.write("SOURCE:FUNCTION:MODE CURRENT")
-            self._visa_resource.write("SOURCE:CURRENT:MODE SWEEP")
-            self._visa_resource.write("SOURCE:CURRENT:RANGE " + str(stopValue))
-            self._visa_resource.write("SOURCE:CURRENT:START " + str(startValue))
-            self._visa_resource.write("SOURCE:CURRENT:STOP " + str(stopValue))
-            self._visa_resource.write("SOURCE:CURRENT:STEP " + str(sourceStep))
-        else:
-            logger.error("Sweep not configured. Expected source to be one of ['voltage' | 'current'].")
+    @property
+    def ratio(self):
+        """Returns whether the instrument reports channel 1 divided by channel 2."""
+        return self.query_boolean(":SENS:VOLT:RAT?")
 
-        return numPts
+    @ratio.setter
+    def ratio(self, value):
+        state = check_boolean(value, "ratio")
+        self.write(f":SENS:VOLT:RAT {int(state)}")
 
-    def setMeasure(self, measure, senseMode=0):
-        """Specify what the instrument should measure.
+    @property
+    def delta(self):
+        """Returns whether the instrument reports the delta of the two channels."""
+        return self.query_boolean(":SENS:VOLT:DELT?")
 
-        Arguments:
-            measure (str) : What to measure. One of ['voltage' | 'current' | 'resistance'].
-           senseMode (int, optional) : If measuring resistance, set to 0 for two-wire, 1 for four-wire measurements.
+    @delta.setter
+    def delta(self, value):
+        state = check_boolean(value, "delta")
+        self.write(f":SENS:VOLT:DELT {int(state)}")
+
+    # Temperature
+
+    @property
+    def temperature_unit(self):
+        """Returns the units temperature is reported in.
+
+        One of celsius, fahrenheit or kelvin.
         """
+        reply = self.query(":UNIT:TEMP?").strip().upper()
+        for name, code in TEMPERATURE_UNITS.items():
+            if reply.startswith(code):
+                return name
+        return reply
 
-        self._visa_resource.write("SENSE:FUNCTION:OFF 'CURR:DC', 'VOLT:DC', 'RES'")
+    @temperature_unit.setter
+    def temperature_unit(self, value):
+        code = check_choice(value, TEMPERATURE_UNITS, "temperature unit")
+        self.write(f":UNIT:TEMP {code}")
 
-        if measure.lower() == "voltage":
-            self._visa_resource.write("SENSE:FUNCTION:ON 'VOLTAGE:DC'")
-        elif measure.lower() == "current":
-            self._visa_resource.write("SENSE:FUNCTION:ON 'CURRENT:DC'")
-        elif measure.lower() == "resistance":
-            self._visa_resource.write("SENSE:FUNCTION:ON 'CURRENT:DC'")
-            self._visa_resource.write("SENSE:FUNCTION:ON 'RESISTANCE'")
+    @property
+    def thermocouple(self):
+        """Returns which thermocouple type is fitted."""
+        return self.query(":SENS:TEMP:TC?").strip().upper()
 
-            # configure the instrument to use two- or four-wire sense mode
-            if senseMode == 0:
-                self._visa_resource.write("SYSTEM:RSENSE OFF")
-            elif senseMode == 1:
-                self._visa_resource.write("SYSTEM:RSENSE ON")
+    @thermocouple.setter
+    def thermocouple(self, value):
+        letter = str(value).strip().upper()
+        if letter not in THERMOCOUPLE_TYPES:
+            raise RangeError(
+                f"The thermocouple type can be {', '.join(THERMOCOUPLE_TYPES)}, "
+                f"but got {value!r}."
+            )
+        self.write(f":SENS:TEMP:TC {letter}")
 
-        else:
-            logger.error("Measurement type not set. Expected one of ['voltage' | 'current' | 'resistance']")
+    @property
+    def reference_junction_temperature(self):
+        """Returns the simulated reference junction temperature, in degrees Celsius."""
+        return self.query_float(":SENS:TEMP:RJUN1:SIM?")
 
-    def setCompliance(self, source, limit):
-        """Specify the compliance limit for whatever the instrument is sourcing.
+    @reference_junction_temperature.setter
+    def reference_junction_temperature(self, value):
+        check_range(value, 0, 60, "reference junction temperature", " C")
+        self.write(f":SENS:TEMP:RJUN1:SIM {value}")
 
-        Arguments:
-            source (str) : The type of output the instrument is sourcing. One of ['voltage' | 'current'].
-            limit  (float): The compliance limit, in volts or amps.
+    # Taking readings
+
+    def read(self):
+        """Trigger a fresh reading and return it."""
+        return self.query_float(":READ?")
+
+    def fetch(self):
+        """Return the last reading again, without triggering a new one."""
+        return self.query_float(":FETC?")
+
+    def latest(self):
+        """Return the most recent reading, whenever it was taken."""
+        return self.query_float(":SENS:DATA:LAT?")
+
+    def fresh(self):
+        """Block until a reading that has not been returned before is available.
+
+        Distinct from latest(), which will hand back the same reading twice.
         """
+        return self.query_float(":SENS:DATA:FRES?")
 
-        if source.lower() == 'voltage':
-            self._visa_resource.write("SENS:VOLT:PROT " + str(limit))
-        if source.lower() == 'current':
-            self._visa_resource.write("SENS:CURR:PROT " + str(limit))
-        else:
-            logger.error("Compliance limit not set. Expected one of ['voltage' | 'current']")
+    def initiate(self):
+        """Start the configured measurement."""
+        self.write(":INIT")
 
-    def getMeasure(self):
-        """Get what the instrument is currently configured to measure.
+    def abort(self):
+        """Stop the measurement and return to idle."""
+        self.write(":ABOR")
 
-        Returns:
-            (str): One of ['voltage' | 'current' | 'resistance']
+    @property
+    def continuous_initiation(self):
+        """Returns whether the instrument re-arms itself after each measurement."""
+        return self.query_boolean(":INIT:CONT?")
+
+    @continuous_initiation.setter
+    def continuous_initiation(self, value):
+        state = check_boolean(value, "continuous initiation")
+        self.write(f":INIT:CONT {int(state)}")
+
+    # Triggering
+
+    @property
+    def trigger_source(self):
+        """Returns what triggers a reading."""
+        reply = self.query(":TRIG:SOUR?").strip().upper()
+        for name, code in TRIGGER_SOURCES.items():
+            if reply.startswith(code):
+                return name
+        return reply
+
+    @trigger_source.setter
+    def trigger_source(self, value):
+        code = check_choice(value, TRIGGER_SOURCES, "trigger source")
+        self.write(f":TRIG:SOUR {code}")
+
+    @property
+    def trigger_count(self):
+        """Returns how many readings one trigger sequence takes."""
+        return self.query_integer(":TRIG:COUN?")
+
+    @trigger_count.setter
+    def trigger_count(self, value):
+        if str(value).strip().lower() in ("inf", "infinite"):
+            self.write(":TRIG:COUN INF")
+            return
+        count = check_integer_range(value, 1, 9999, "trigger count")
+        self.write(f":TRIG:COUN {count}")
+
+    @property
+    def trigger_delay(self):
+        """Returns the delay between the trigger and the reading, in seconds."""
+        return self.query_float(":TRIG:DEL?")
+
+    @trigger_delay.setter
+    def trigger_delay(self, value):
+        check_range(value, 0, 999999.999, "trigger delay", " s")
+        self.write(f":TRIG:DEL {value}")
+
+    @property
+    def trigger_auto_delay(self):
+        """Returns whether the instrument chooses its own trigger delay."""
+        return self.query_boolean(":TRIG:DEL:AUTO?")
+
+    @trigger_auto_delay.setter
+    def trigger_auto_delay(self, value):
+        state = check_boolean(value, "auto trigger delay")
+        self.write(f":TRIG:DEL:AUTO {int(state)}")
+
+    @property
+    def trigger_timer(self):
+        """Returns the interval of the timer trigger source, in seconds."""
+        return self.query_float(":TRIG:TIM?")
+
+    @trigger_timer.setter
+    def trigger_timer(self, value):
+        check_range(value, 0, 999999.999, "trigger timer interval", " s")
+        self.write(f":TRIG:TIM {value}")
+
+    @property
+    def sample_count(self):
+        """Returns how many readings each trigger produces."""
+        return self.query_integer(":SAMP:COUN?")
+
+    @sample_count.setter
+    def sample_count(self, value):
+        count = check_integer_range(value, 1, MAXIMUM_BUFFER_POINTS, "sample count")
+        self.write(f":SAMP:COUN {count}")
+
+    # Buffer
+
+    @property
+    def buffer_size(self):
+        """Returns how many readings the buffer will hold."""
+        return self.query_integer(":TRAC:POIN?")
+
+    @buffer_size.setter
+    def buffer_size(self, value):
+        points = check_integer_range(
+            value, 2, MAXIMUM_BUFFER_POINTS, "buffer size", " readings"
+        )
+        self.write(f":TRAC:POIN {points}")
+
+    def read_buffer(self):
+        """Return everything stored in the buffer, as a list of floats."""
+        return self.query_floats(":TRAC:DATA?")
+
+    def clear_buffer(self):
+        """Discard the buffer contents."""
+        self.write(":TRAC:CLE")
+
+    def start_buffer(self, size=None):
+        """Clear the buffer, size it, and arm it to fill."""
+        self.clear_buffer()
+        if size is not None:
+            self.buffer_size = size
+        self.write(":TRAC:FEED:CONT NEXT")
+
+    def statistic(self, name):
+        """Return a statistic over the readings in the buffer."""
+        code = check_choice(name, STATISTICS, "statistic")
+        self.write(f":CALC2:FORM {code}")
+        self.write(":CALC2:STAT ON")
+        return self.query_float(":CALC2:DATA?")
+
+    # System and front panel
+
+    @property
+    def auto_zero(self):
+        """Returns whether the instrument re-zeros its A/D before each reading."""
+        return self.query_boolean(":SYST:AZER:STAT?")
+
+    @auto_zero.setter
+    def auto_zero(self, value):
+        state = check_boolean(value, "auto zero")
+        self.write(f":SYST:AZER:STAT {int(state)}")
+
+    @property
+    def front_autozero(self):
+        """Returns whether front-end auto zero is on.
+
+        Turning this off roughly doubles the reading rate, at the cost of drift.
         """
+        return self.query_boolean(":SYST:FAZ:STAT?")
 
-        # instrument returns one of "VOLT:DC", "RES" or "CURR:DC"
-        self._visa_resource.write('*TRG')
-        query_result = self._visa_resource.query("SENSE:DATA:FRESH?")
-        
-        return float(query_result)
+    @front_autozero.setter
+    def front_autozero(self, value):
+        state = check_boolean(value, "front autozero")
+        self.write(f":SYST:FAZ:STAT {int(state)}")
 
-    def getSource(self):
-        """Get the type and level of output the instrument is currently configured to source.
+    @property
+    def line_synchronisation(self):
+        """Returns whether readings are synchronised to the power line."""
+        return self.query_boolean(":SYST:LSYN:STAT?")
 
-        Returns:
-            (tuple(str, float)) : A tuple containing one of ['voltage' | 'current'] along
-            with the level of the output, in volts or amps.
+    @line_synchronisation.setter
+    def line_synchronisation(self, value):
+        state = check_boolean(value, "line synchronisation")
+        self.write(f":SYST:LSYN:STAT {int(state)}")
+
+    def preset(self):
+        """Return the instrument to its SYSTem:PRESet defaults."""
+        self.write(":SYST:PRES")
+
+    @property
+    def display_enabled(self):
+        """Returns whether the front-panel display is on."""
+        return self.query_boolean(":DISP:ENAB?")
+
+    @display_enabled.setter
+    def display_enabled(self, value):
+        state = check_boolean(value, "display")
+        self.write(f":DISP:ENAB {int(state)}")
+
+    @property
+    def display_text(self):
+        """Returns the message shown on the display."""
+        return self.query(":DISP:TEXT:DATA?").strip().strip('"')
+
+    @display_text.setter
+    def display_text(self, value):
+        text = str(value)
+        if len(text) > 12:
+            raise RangeError(
+                f"Display text is at most 12 characters, but got {len(text)}."
+            )
+        self.write(f':DISP:TEXT:DATA "{text}"')
+        self.write(":DISP:TEXT:STAT 1")
+
+    def clear_display_text(self):
+        """Stop showing a message and return the display to readings."""
+        self.write(":DISP:TEXT:STAT 0")
+
+    def go_to_local(self):
+        """Return the instrument to front-panel control."""
+        self.write(":SYST:LOC")
+
+    def go_to_remote(self):
+        """Put the instrument under remote control."""
+        self.write(":SYST:REM")
+
+    # Common procedures
+
+    def read_average(self, count=10, settle=0.0):
+        """Take several readings and report the mean and its uncertainty.
+
+        Nanovolt measurements are almost always averaged, and the scatter is
+        worth having: it says whether the number is limited by noise or by
+        something that is drifting.
+
+        :param count: How many readings to take.
+        :param settle: Seconds to wait between readings.
+        :return: A tuple of (mean, standard error of the mean). The error is
+                 zero for a single reading.
         """
+        number = check_integer_range(count, 1, 100000, "number of readings")
+        check_range(settle, 0, 3600, "settling time", " s")
 
-        source = self._visa_resource.query("SOURCE:FUNCTION:MODE?")
+        readings = []
+        for index in range(number):
+            if settle and index:
+                time.sleep(settle)
+            readings.append(self.read())
 
-        if source == "VOLT":
-            return ('voltage', self._visa_resource.query("SOURCE:VOLTAGE:LEVEL?")[0])
-        elif source == "CURR":
-            return ('current', self._visa_resource.query("SOURCE:CURRENT:LEVEL?")[0])
+        average = statistics.fmean(readings)
+        if number < 2:
+            return average, 0.0
+        return average, statistics.stdev(readings) / math.sqrt(number)
 
-    def close(self):
-        """Closes the VISA session and marks the handle as invalid."""
-        self._visa_resource.close()
-        return None
-
-    ########################################################
-    # Operation methods: use these to operate the instrument #
-    ########################################################
-
-    def outputOn(self):
-        """Turn the output on."""
-
-        self._visa_resource.write("OUTPUT ON")
-        self._activateBuffer()
-
-    def outputOff(self):
-        """Turn the output off."""	
-
-        self.readTrace()
-        self._deactivateBuffer()
-        self._visa_resource.write("OUTPUT OFF")
-
-    def measurePoint(self):
-        """Record a data point in the internal buffer. Read and clear the buffer if it is full.
-        
-        Approx. 25% faster than readPoint()."""
-
-        buffer_points = self._visa_resource.query_ascii_values("TRACE:POINTS:ACTUAL?")[0]
-        
-        if buffer_points > 2499:
-            self.readTrace()
-
-        self._visa_resource.write("INIT")
-        self._visa_resource.assert_trigger()
-
-    def readPoint(self):
-        """Perform a single measurement with the current configuration, read the result, and store it in self.data."""
-
-        self.measurePoint()
-        self.readTrace()
-
-    # perform a measurement w/ current parameters
-    def readTrace(self):
-        self._pullData()
-        self._clearData()
-
-    # starting with the output off, turn the output on then ramp the output up/down to a specified level
-    def rampOutputOn(self, rampTarget, nSteps=100, timeStep=50E-3):
-        rampStart = 0
-        self.outputOn()
-        sourceValue = self._rampOutput(rampStart, rampTarget, nSteps, timeStep)
-        return sourceValue
-
-    # starting with the output on, ramp the output to 0, then turn the output off
-    def rampOutputOff(self, nSteps=100, timeStep=50E-3):
-        rampTarget = 0
-        rampStart = float(self._visa_resource.query("SOURCE:CURRENT:LEVEL?"))
-        sourceValue = self._rampOutput(rampStart, rampTarget, nSteps, timeStep)
-        self.outputOff()
-        return sourceValue
-
-    # save the collected data to file
-    # mode 'a' appends to existing file, mode 'i' increments file counter ie test0001.txt, test0002,txt
-    def saveData(self, filePath, fileName="test.csv", mode='i'):
-        """Save the collected data to file in csv format.
-
-        Arguments:
-            filePath (str): where the place the saved data file
-            fileName (str): the filename to use for the saved data
-            mode (str, optional): whether to append ('a') to an existing file or create a new file with
-                an incrementing ('i') number at the end
-        """
-
-        # make sure the filePath has a trailing slash
-        if filePath[-1] != '/':
-            filePath += '/'
-
-        # make sure the fileName ends with .csv
-        if fileName[-4:] != '.csv':
-            fileName += '.csv'
-
-        # append to existing files
-        if mode == 'a':
-            filePathAndName = os.path.join(filePath, fileName)
-            self.data.to_csv(filePathAndName, index=False, mode='a+')
-        # create new files with incrementing filenames, e.g. filename0001.csv
-        else:
-            saveCounter = 0
-            while True:
-                saveCounter += 1
-
-                incrementalFileName = fileName.rstrip('.csv') + "{:04d}".format(saveCounter) + ".csv"
-                filePathAndName = os.path.join(filePath, incrementalFileName)
-
-                if not os.path.exists(filePathAndName):
-                    break
-            self.data.to_csv(filePathAndName, index=False, mode='w')
-
-    def getConfig(self):
-        """Get a string summarizing the current instrument configuration.
-
-        Returns:
-            (str) : A string describing the current instrument configuration.
-        """
-
-        configDict = {'Measuring: ': self.getMeasure(),
-                      'Sourcing: ': self.getSource(),
-                      'Compliance: ': self.getCompliance()}
-
-        return ' - '.join(configDict.items())
-
-    def getCompliance(self):
-        """Get a string describing the compliance in the current
-           configuration.
-        """
-        pass
-
-    #####################################################################################################
-    # Deprecated methods
-    #####################################################################################################
-
-    def _setTLINK(self, inputTrigs, outputTrigs):
-        """Set the instrument to use TLINK triggering."""
-        self._visa_resource.write("TRIG:SOURCE TLINK")
-        self._visa_resource.write("TRIG:INPUT {}".format(inputTrigs))
-        self._visa_resource.write("TRIG:OUTPUT {}".format(outputTrigs))
-        raise DeprecationWarning
-
-    def _setNoTLINK(self):
-        """Set the instrument to use immediate triggering."""
-        self._visa_resource.write("TRIG:SOURCE IMMEDIATE")
-        self._visa_resource.write("TRIG:INPUT NONE")
-        self._visa_resource.write("TRIG:OUTPUT NONE")
-        raise DeprecationWarning
+    def __repr__(self):
+        return f"Keithley2182({self._transport!r})"

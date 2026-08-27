@@ -1,186 +1,207 @@
-"""Module containing a class to interface with an Oxford Instruments IPS 120-10.
+"""Driver for the Oxford Instruments IPS 120-10 magnet power supply.
 
-This module requires a National Instruments VISA driver, which can be found at
-https://www.ni.com/visa/
+An older GPIB supply using Oxford's single-letter protocol. Field limits belong
+to the magnet rather than the supply, so they are a constructor argument.
 
-Attributes:
-    resource_manager: the pyvisa resource manager which provides the visa
-                      objects used for communicating over the GPIB interface
-
-    logger: a python logger object
-
-
-Classes:
-    ips120: a class for interfacing with a IPS 120-10 magnet power supply
-
+Commands are transcribed from the *IPS 120-10 Operator's Handbook*.
 """
-from datetime import datetime
+
 import time
-import logging
 
-import pyvisa as visa
+from ..core import check_boolean, check_choice, check_range
+from ..core.errors import InstrumentTimeoutError
+from .legacy import OxfordLegacyInstrument
 
-# create a logger object for this module
-logger = logging.getLogger(__name__)
-# added so that log messages show up in Jupyter notebooks
-logger.addHandler(logging.StreamHandler())
+# Numbered parameters the R command reads.
+PARAMETERS = {
+    "demand_current": 0,
+    "supply_voltage": 1,
+    "measured_current": 2,
+    "demand_current_setpoint": 5,
+    "current_sweep_rate": 6,
+    "demand_field": 7,
+    "field_setpoint": 8,
+    "field_sweep_rate": 9,
+    "software_voltage_limit": 15,
+    "persistent_current": 16,
+    "trip_current": 17,
+    "persistent_field": 18,
+    "trip_field": 19,
+    "switch_heater_current": 20,
+    "safe_current_negative": 21,
+    "safe_current_positive": 22,
+    "lead_resistance": 23,
+    "magnet_inductance": 24,
+}
 
-try:
-    # the pyvisa manager we'll use to connect to the GPIB resources
-    resource_manager = visa.ResourceManager()
-except OSError:
-    logger.exception("\n\tCould not find the VISA library. Is the National Instruments VISA driver installed?\n\n")
+ACTIVITIES = {"hold": 0, "to setpoint": 1, "to zero": 2, "clamp": 4}
+HEATER_STATES = {"off": 0, "on": 1, "off forced": 2}
+DEFAULT_FIELD_LIMIT = 8.0
 
 
-class Ips120:
-    
-    def __init__(self, GPIBaddr):
-        """Connect to an IPS 120-10 at the specified GPIB address
+class Ips120(OxfordLegacyInstrument):
+    """Interface to an IPS 120-10 magnet power supply.
 
-        Args:
-            GPIBaddr(int): GPIB address of the IPS 120-10
+        supply = Ips120(gpib_address=25, field_limit=8.0)
+        supply.set_control("remote unlocked")
+        supply.ramp_to_field(1.0)
+
+    :param field_limit: Largest field this magnet may be asked for, in tesla.
+    """
+
+    def __init__(self, *args, field_limit=DEFAULT_FIELD_LIMIT, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.field_limit = float(field_limit)
+
+    # Readings
+
+    @property
+    def field(self):
+        """Returns the field the supply is presently producing, in tesla."""
+        return self.read_parameter(PARAMETERS["demand_field"])
+
+    @property
+    def persistent_field(self):
+        """Returns the field held by the magnet in persistent mode, in tesla."""
+        return self.read_parameter(PARAMETERS["persistent_field"])
+
+    @property
+    def current(self):
+        """Returns the measured magnet current, in amps."""
+        return self.read_parameter(PARAMETERS["measured_current"])
+
+    @property
+    def voltage(self):
+        """Returns the supply output voltage, in volts."""
+        return self.read_parameter(PARAMETERS["supply_voltage"])
+
+    def parameter(self, name):
+        """Read any documented parameter by name.
+
+        :param name: One of the keys of PARAMETERS.
         """
-        self._visa_resource = resource_manager.open_resource("GPIB::%d" % GPIBaddr)
-        self._visa_resource.read_termination = '\r'
-        self.setDisplay('tesla')
+        number = check_choice(name, PARAMETERS, "parameter")
+        return self.read_parameter(number)
 
-    def setControl(self, state=3):
-        """Set the LOCAL / REMOTE control state of the IPS 120-10
+    # Setpoints
 
-        0 - Local & Locked (default state)
-        1 - Remote & Locked
-        2 - Local & Unlocked
-        3 - Remote & Locked
+    @property
+    def field_setpoint(self):
+        """Returns the field the supply is ramping towards, in tesla."""
+        return self.read_parameter(PARAMETERS["field_setpoint"])
 
-        Args:
-            state(int): the state in which to place the IPS 120-10
+    @field_setpoint.setter
+    def field_setpoint(self, value):
+        check_range(value, -self.field_limit, self.field_limit, "field setpoint", " T")
+        self.command("J", f"{float(value):.4f}")
+
+    @property
+    def field_sweep_rate(self):
+        """Returns the rate the field sweeps at, in tesla per minute."""
+        return self.read_parameter(PARAMETERS["field_sweep_rate"])
+
+    @field_sweep_rate.setter
+    def field_sweep_rate(self, value):
+        check_range(value, 0, self.field_limit, "field sweep rate", " T/min")
+        self.command("T", f"{float(value):.4f}")
+
+    # Activity and heater
+
+    @property
+    def activity(self):
+        """Returns what the supply is doing.
+
+        One of 'hold', 'to setpoint', 'to zero' or 'clamp'.
         """
-        assert type(state) == int, 'argument must be integer'
-        assert state in [0,1,2,3], 'argument must be one of [0,1,2,3]'
+        status = self.status()
+        code = int(status[4]) if len(status) > 4 else 0
+        for name, value in ACTIVITIES.items():
+            if value == code:
+                return name
+        return str(code)
 
-        self._visa_resource.write("$C{}".format(state))
+    @activity.setter
+    def activity(self, value):
+        code = check_choice(value, ACTIVITIES, "activity")
+        self.command("A", code)
 
-    def readField(self):
-        """Read the current magnetic field in Tesla
+    @property
+    def switch_heater(self):
+        """Returns whether the persistent-mode switch heater is on."""
+        status = self.status()
+        return len(status) > 8 and status[8] == "1"
 
-        Returns:
-            field(float): current magnetic field in Tesla
+    @switch_heater.setter
+    def switch_heater(self, value):
+        if isinstance(value, str) and value.strip().lower() == "off forced":
+            self.command("H", HEATER_STATES["off forced"])
+            return
+        state = check_boolean(value, "switch heater")
+        self.command("H", HEATER_STATES["on" if state else "off"])
+
+    def status(self):
+        """Return the raw status string (``X``).
+
+        The reply is a fixed-width field of digits describing system status,
+        activity, heater state and sweep mode.
         """
-        self._visa_resource.write('R 7')
-        self._visa_resource.wait_for_srq()
-        value_str = self._visa_resource.read()
+        return self.query("X").strip()
 
-        return float(value_str.strip('R+'))
+    def set_display(self, quantity="tesla"):
+        """Choose whether the front panel shows amps or tesla (``F<n>``)."""
+        code = check_choice(quantity, {"amps": 8, "tesla": 9}, "display quantity")
+        self.command("F", code)
 
-    def readFieldSetpoint(self):
-        """Read the current set point for the magnetic field in Tesla
+    # Ramping
 
-        Returns:
-            setpoint(float): current set point for the magnetic field in Tesla
+    def hold(self):
+        """Stop any sweep and hold the present field."""
+        self.activity = "hold"
+
+    def ramp_to_setpoint(self):
+        """Sweep towards the field setpoint."""
+        self.activity = "to setpoint"
+
+    def ramp_to_zero(self):
+        """Sweep the field down to zero."""
+        self.activity = "to zero"
+
+    def clamp(self):
+        """Clamp the output."""
+        self.activity = "clamp"
+
+    def wait_for_field(self, target=None, tolerance=0.01, timeout=3600.0, interval=5.0):
+        """Block until the field reaches its setpoint.
+
+        :param target: Field to wait for, in tesla. Defaults to the setpoint.
+        :param tolerance: How close counts as arrived, in tesla.
+        :raises InstrumentTimeoutError: If it never gets there.
         """
-        self._visa_resource.write('R 8')
-        self._visa_resource.wait_for_srq()
-        value_str = self._visa_resource.read()
+        if target is None:
+            target = self.field_setpoint
+        target = float(target)
+        check_range(tolerance, 0, self.field_limit, "tolerance", " T")
 
-        return float(value_str.strip('R+'))
+        deadline = time.monotonic() + float(timeout)
+        while abs(self.field - target) > float(tolerance):
+            if time.monotonic() > deadline:
+                raise InstrumentTimeoutError(
+                    f"The magnet did not reach {target} T within {timeout} s. "
+                    f"It last read {self.field} T."
+                )
+            time.sleep(interval)
+        return self.field
 
-    def readFieldSweepRate(self):
-        """Read the current magnetic field sweep rate in Tesla/min
+    def ramp_to_field(self, field, wait=True, timeout=3600.0):
+        """Set the setpoint and sweep to it.
 
-        Returns:
-            sweep_rate(float): current magnetic field sweep rate in Tesla/min
+        :param field: Target field in tesla.
+        :param wait: Block until the sweep finishes.
         """
-        self._visa_resource.write('R 9')
-        self._visa_resource.wait_for_srq()
-        value_str = self._visa_resource.read()
+        self.field_setpoint = field
+        self.ramp_to_setpoint()
+        if wait:
+            self.wait_for_field(field, timeout=timeout)
 
-        return float(value_str.strip('R+'))
-
-    def setActivity(self, state=1):
-        """Set the field activation method
-
-        0 - Hold  
-        1 - To Set Point  
-        2 - To Zero  
-        3 - Clamp (clamp the power supply output)
-
-        Args:
-            state(int): the field activation method
-        """
-        assert type(state) == int, 'argument must be integer'
-        assert state in [0,1,2,3], 'argument must be one of [0,1,2,3]'
-        self._visa_resource.write("$A{}".format(state))
-
-
-    def setHeater(self, state=1):
-        """Set the switch heater activation state
-
-        0 - Heater Off              (close switch)
-        1 - Heater On if PSU=Magnet (open switch)
-        2 - Heater On, no checks    (open switch)
-
-        Args:
-            state(int): the switch heater activation state
-        """
-        assert type(state) == int, 'argument must be integer'
-        assert state in [0,1,2], 'argument must be one of [0,1,2]'
-        self._visa_resource.write("$H{}".format(state))
-
-        # TODO: add timer to account for time it takes for switch to activate
-
-    def setFieldSetpoint(self, field):
-        """Set the magnetic field set point, in Tesla
-
-        Args:
-            field(float): the magnetic field set point, in Tesla
-        """
-        MAX_FIELD = 8
-        assert abs(field) < MAX_FIELD, 'field must be less than {}'.format(MAX_FIELD)
-
-        self._visa_resource.write("$J{}".format(field))
-
-    def setFieldSweepRate(self, rate):
-        """Set the magnetic field sweep rate, in Tesla/min
-
-        Args:
-            rate(float): the magnetic field sweep rate, in Tesla/min
-        """
-        self._visa_resource.write("$T{}".format(rate))
-
-    def setDisplay(self, display):
-        """Set the display to show amps or tesla
-
-        Args:
-            display(str): One of ['amps','tesla']
-        """
-        assert display in ['amps', 'tesla'], "argument must be one of ['amps','tesla']"
-
-        mode_dict = {'amps':8,
-                     'tesla':9
-                    }
-
-        self._visa_resource.write("$M{}".format(mode_dict[display]))
-
-    def waitForField(self, timeout=600, error_margin=0.01):
-        """Wait for the field to reach the set point
-
-        Args:
-            timeout(int): maximum time to wait, in seconds
-            error_margin(float): how close the field needs to be to the set point, in tesla
-
-        Returns:
-            (bool): whether the field set point was reached
-        """
-        start_time = datetime.now()
-        stop_time = start_time + datetime.timedelta(seconds=timeout)
-
-        while datetime.now() < stop_time:
-            field = self.readField()
-            set_point = self.readFieldSetpoint()
-
-            if abs(field - set_point) < error_margin:
-                return True
-
-            time.sleep(5)
-
-        return False
+    def __repr__(self):
+        return f"Ips120({self._transport!r})"

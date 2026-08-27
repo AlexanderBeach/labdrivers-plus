@@ -1,296 +1,379 @@
-import socket
+"""Driver for the Oxford Instruments Mercury iPS magnet power supply.
 
-import pyvisa as visa
+The iPS drives one magnet per axis. Each axis is a :class:`Magnet` with its own
+setpoints, ramp rates and switch heater, and :class:`MercuryIps` groups the
+axes a system actually has.
+
+Field limits belong to the magnet, not to the power supply, so they are given
+per axis at construction. The defaults suit a three-axis vector magnet with a
+6 T solenoid and 1 T split coils. Pass ``field_limits`` for any other system.
+
+Commands are transcribed from the *Mercury iPS Operator's Manual* (issue 20).
+"""
+
+import math
+import time
+
+from ..core import check_boolean, check_choice, check_range
+from ..core.errors import RangeError
+from ..core.sweep import round_trip, sweep_values
+from .mercury import MercuryInstrument
+
+AXES = ("GRPX", "GRPY", "GRPZ")
+
+# Field limits in tesla per axis. Override with field_limits= for a different
+# magnet. These are only a sensible starting point.
+DEFAULT_FIELD_LIMITS = {"GRPX": 1.0, "GRPY": 1.0, "GRPZ": 6.0}
+
+# Largest current a Mercury iPS output will deliver, in amps.
+DEFAULT_CURRENT_LIMIT = 130.0
+
+ACTIONS = {
+    "hold": "HOLD",
+    "ramp to setpoint": "RTOS",
+    "ramp to zero": "RTOZ",
+    "clamp": "CLMP",
+}
 
 
-class MercuryIps:
+class Magnet:
+    """One axis of a Mercury iPS.
 
-    # Magnet class
+    :param instrument: The MercuryIps this axis belongs to.
+    :param axis: 'GRPX', 'GRPY' or 'GRPZ'.
+    :param field_limit: Largest field this magnet may be asked for, in tesla.
+    :param current_limit: Largest current this magnet may be asked for, in amps.
+    """
 
-    class Magnet:
+    def __init__(
+        self, instrument, axis, field_limit=None, current_limit=DEFAULT_CURRENT_LIMIT
+    ):
+        axis = str(axis).upper().strip()
+        if axis not in AXES:
+            raise RangeError(
+                f"The magnet axis can be {', '.join(AXES)}, but got {axis!r}."
+            )
+        self._instrument = instrument
+        self.axis = axis
+        self.field_limit = float(
+            DEFAULT_FIELD_LIMITS[axis] if field_limit is None else field_limit
+        )
+        self.current_limit = float(current_limit)
+
+    def _noun(self, tail):
+        return f"DEV:{self.axis}:PSU:{tail}"
+
+    # Field
+
+    @property
+    def field(self):
+        """Returns the magnetic field at the magnet, in tesla."""
+        return self._instrument.read_value(self._noun("SIG:FLD"), "T")
+
+    @property
+    def persistent_field(self):
+        """Returns the field held by the magnet in persistent mode, in tesla."""
+        return self._instrument.read_value(self._noun("SIG:PFLD"), "T")
+
+    @property
+    def field_setpoint(self):
+        """Returns the field the magnet is being ramped towards, in tesla."""
+        return self._instrument.read_value(self._noun("SIG:FSET"), "T")
+
+    @field_setpoint.setter
+    def field_setpoint(self, value):
+        check_range(
+            value,
+            -self.field_limit,
+            self.field_limit,
+            f"{self.axis} field setpoint",
+            " T",
+        )
+        self._instrument.set_noun(self._noun("SIG:FSET"), value)
+
+    @property
+    def field_ramp_rate(self):
+        """Returns the rate the field ramps at, in tesla per minute."""
+        return self._instrument.read_value(self._noun("SIG:RFST"), "T/m")
+
+    @field_ramp_rate.setter
+    def field_ramp_rate(self, value):
+        check_range(value, 0, self.field_limit, "field ramp rate", " T/min")
+        self._instrument.set_noun(self._noun("SIG:RFST"), value)
+
+    # Current
+
+    @property
+    def current(self):
+        """Returns the current through the magnet, in amps."""
+        return self._instrument.read_value(self._noun("SIG:CURR"), "A")
+
+    @property
+    def current_setpoint(self):
+        """Returns the current the magnet is being ramped towards, in amps."""
+        return self._instrument.read_value(self._noun("SIG:CSET"), "A")
+
+    @current_setpoint.setter
+    def current_setpoint(self, value):
+        check_range(
+            value,
+            -self.current_limit,
+            self.current_limit,
+            f"{self.axis} current setpoint",
+            " A",
+        )
+        self._instrument.set_noun(self._noun("SIG:CSET"), value)
+
+    @property
+    def current_ramp_rate(self):
+        """Returns the rate the current ramps at, in amps per minute."""
+        return self._instrument.read_value(self._noun("SIG:RCST"), "A/m")
+
+    @current_ramp_rate.setter
+    def current_ramp_rate(self, value):
+        check_range(value, 0, self.current_limit, "current ramp rate", " A/min")
+        self._instrument.set_noun(self._noun("SIG:RCST"), value)
+
+    @property
+    def voltage(self):
+        """Returns the voltage across the magnet leads, in volts."""
+        return self._instrument.read_value(self._noun("SIG:VOLT"), "V")
+
+    # Switch heater
+
+    @property
+    def switch_heater(self):
+        """Returns whether the persistent-mode switch heater is on."""
+        reply = self._instrument.read_noun(self._noun("SIG:SWHT"))
+        return self._instrument.parse_word(reply, "SWHT") == "ON"
+
+    @switch_heater.setter
+    def switch_heater(self, value):
+        state = check_boolean(value, "switch heater")
+        self._instrument.set_noun(self._noun("SIG:SWHT"), "ON" if state else "OFF")
+
+    # Actions and state
+
+    @property
+    def action(self):
+        """Returns what the supply is doing: 'hold', 'ramp to setpoint', 'ramp to
+        zero' or 'clamp'."""
+        reply = self._instrument.read_noun(self._noun("ACTN"))
+        code = self._instrument.parse_word(reply, "ACTN")
+        for name, action in ACTIONS.items():
+            if code == action:
+                return name
+        return code.lower()
+
+    @action.setter
+    def action(self, value):
+        code = check_choice(value, ACTIONS, "magnet action")
+        self._instrument.set_noun(self._noun("ACTN"), code)
+
+    def hold(self):
+        """Stop any ramp and hold the present field."""
+        self.action = "hold"
+
+    def ramp_to_setpoint(self):
+        """Ramp towards the field setpoint."""
+        self.action = "ramp to setpoint"
+
+    def ramp_to_zero(self):
+        """Ramp the field down to zero."""
+        self.action = "ramp to zero"
+
+    def clamp(self):
+        """Clamp the output."""
+        self.action = "clamp"
+
+    def ramping(self):
+        """Whether the magnet is ramping, in either direction."""
+        return self.action in ("ramp to setpoint", "ramp to zero")
+
+    def holding(self):
+        """Whether the magnet is holding its field."""
+        return self.action == "hold"
+
+    def clamped(self):
+        """Whether the magnet output is clamped."""
+        return self.action == "clamp"
+
+    def wait_for_field(self, timeout=3600.0, interval=5.0):
+        """Block until the magnet stops ramping.
+
+        :param timeout: Seconds to wait before giving up.
+        :param interval: Seconds between checks.
         """
-        Constructor for a magnet along a certain axis.
+        self._instrument.wait_until(
+            lambda: not self.ramping(),
+            timeout=timeout,
+            interval=interval,
+            description=f"the {self.axis} magnet to finish ramping",
+        )
 
-        :param axis: The axis for the magnet, given by ['GRPX'|'GRPY'|'GRPZ']
-        :type axis: string
-        :param mode: Connection, given by ['ip'|'visa']
-        :type mode: string
-        :param resource_name: VISA resource name of the MercuryIPS
-        :type resource_name: string
-        :param ip_address: IP address of the MercuryIPS
-        :type ip_address: string
-        :param port: Port number of the Mercury iPS
-        :type port: integer
-        :param timeout: Time to wait for a response from the MercuryIPS before throwing an error.
-        :type timeout: float
-        :param bytes_to_read: Amount of information to read from a response
-        :type bytes_to_read: integer
+    def ramp_to_field(self, field, wait=True, timeout=3600.0):
+        """Set the field setpoint and ramp to it.
+
+        :param field: Target field in tesla.
+        :param wait: Block until the ramp finishes.
         """
-        def __init__(self, axis, mode='visa', resource_name=None, ip_address=None, port=7020, timeout=10.0, bytes_to_read=1024,baudrate = 9600):
-            """
-            Parameters:
-            :param str mode: The connection to the iPS, either 'ip' or 'visa'
-            :param str resource_name: VISA resource name of the Mercury iPS
-            :param str ip_address: IP address of the Mercury iPS
-            :param port: Port number of the Mercury iPS
-            :type port: integer
-            :param timeout: Time in seconds to wait for command acknowledgment
-            :type timeout: float
-            :param bytes_to_read: Number of bytes to read from query
-            :type bytes_to_read: integer
-            """
-            self.axis = axis
-            self.mode = mode
-            self.resource_name = resource_name
-            self.resource_manager = visa.ResourceManager()
-            self.ip_address = ip_address
-            self.port = port
-            self.timeout = timeout
-            self.bytes_to_read = bytes_to_read
-            self.baudrate = baudrate
-            supported_modes = ('ip', 'visa')
-            self.instr = self.resource_manager.open_resource(self.resource_name)
-            if mode.lower().strip() in supported_modes:
-                self.mode = mode
-            else:
-                raise RuntimeError('Mode is not currently supported.')
-            
-            if mode == 'visa':
-                self.instr.baud_rate = self.baudrate
-            
-        ###################
-        # Query functions #
-        ###################
+        self.field_setpoint = field
+        self.ramp_to_setpoint()
+        if wait:
+            self.wait_for_field(timeout=timeout)
 
-        def query_ip(self, command):
-            """Sends a query to the MercuryIPS via ethernet.
-            
-            :param command: The command, which should be in the NOUN + VERB format
-            :type command: string
-            :returns str: The MercuryIPS response
-            """
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((self.ip_address, self.port))
-                s.settimeout(self.timeout)
-                s.sendall(command.encode())
-                response = s.recv(self.bytes_to_read).decode()
+    def sweep_field(
+        self, start, stop, points=None, step=None, settle=0.0, return_to_start=False
+    ):
+        """Ramp through a series of fields, yielding once the magnet arrives.
 
-            return response.decode()
+        The loop body runs with the magnet holding at each field, which is what
+        a field sweep in a transport measurement wants.
 
-        def query_visa(self, command):
-            """Sends a query to the MercuryIPS via VISA.
-            
-            :param command: The command, which should be in the NOUN + VERB format
-            :type command: string
-            :returns str: The MercuryIPS response
-            """
-            instr = self.resource_manager.open_resource(self.resource_name)
-            response = instr.query(command)
-            instr.close()
+            for field in supply.z.sweep_field(-1, 1, points=41):
+                x, y = lockin.measure()
 
-            return response
-
-        @staticmethod
-        def extract_value(response, noun, unit):
-            """Finds the value that is contained within the response to a previously sent query.
-            
-            :param response: The response from a query.
-            :type response: string
-            :param noun: The part of the query that refers to the NOUN (refer to MercuryIPS documentation).
-            :param unit: The measurement unit (e.g. K for Kelvin, T for Tesla).
-            :returns float: The value of the response, but without units.
-            """
-            expected_response = 'STAT:' + noun + ':'
-            value = float(response.replace(expected_response, '').strip('\n').replace(unit, ''))
-            return value
-
-        # Employing hash tables instead of if-else trees
-        QUERY_AND_RECEIVE = {'ip': query_ip, 'visa': query_visa}
-
-        @property
-        def field_setpoint(self):
-            """The magnetic field set point in Tesla"""
-            noun = 'DEV:' + self.axis + ':PSU:SIG:FSET'
-            command = 'READ:' + noun
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-            return self.extract_value(response, noun, 'T')
-
-        @field_setpoint.setter
-        def field_setpoint(self, value):
-            if ((self.axis == 'GRPZ' and (-6 <= value <= 6)) or
-                    ((self.axis == 'GRPX' or self.axis == 'GRPY') and (-1 <= value <= 1))):
-                setpoint = str(value)
-                command = 'SET:DEV:' + self.axis + ':PSU:SIG:FSET:' + setpoint
-                response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-
-                if not response:
-                    raise RuntimeWarning("No response from the MercuryIps after querying the field setpoint.")
-            else:
-                raise RuntimeError("The setpoint must be within the proper limits.")
-
-        @property
-        def field_ramp_rate(self):
-            """The magnetic field ramp rate in Tesla per minute along the magnet axis."""
-            noun = 'DEV:' + self.axis + ':PSU:SIG:RFST'
-            command = 'READ:' + noun
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-            return self.extract_value(response, noun, 'T/m')
-
-        @field_ramp_rate.setter
-        def field_ramp_rate(self, value):
-            ramp_rate = str(value)
-            command = 'SET:DEV:' + self.axis + ':PSU:SIG:RFST:' + ramp_rate
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-
-            if not response:
-                raise RuntimeWarning("No response after setting a field ramp rate.")
-
-        @property
-        def current_setpoint(self):
-            """The set point of the current for a magnet in Amperes."""
-            noun = 'DEV:' + self.axis + ':PSU:SIG:CSET'
-            command = 'READ:' + noun
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-            return self.extract_value(response, noun, 'A')
-
-        @current_setpoint.setter
-        def current_setpoint(self, value):
-            setpoint = str(value)
-            command = 'SET:DEV:' + self.axis + ':PSU:SIG:CSET' + setpoint
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-
-            if not response:
-                raise RuntimeWarning("No response after setting current set point.")
-
-        @property
-        def current_ramp_rate(self):
-            """The ramp rate of the current for a magnet in Amperes per minute."""
-            noun = 'DEV:' + self.axis + ':PSU:SIG:RCST'
-            command = 'READ:' + noun
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-            return self.extract_value(response, noun, 'A/m')
-
-        @current_ramp_rate.setter
-        def current_ramp_rate(self, value):
-            ramp_rate = str(value)
-            command = 'SET:DEV:' + self.axis + ':PSU:SIG:RCST' + ramp_rate
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-
-            if not response:
-                raise RuntimeWarning("No response after setting current ramp rate.")
-
-        @property
-        def magnetic_field(self):
-            """Gets the magnetic field."""
-            noun = 'DEV:' + self.axis + ':PSU:SIG:FLD'
-            command = 'READ:' + noun
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-            return self.extract_value(response, noun, 'T')
-
-        def set_status(self,status):
-            command = 'SET:DEV:' + self.axis + ':PSU:SIG:ACTN:'+status
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-            return response
-		
-        def ramp_to_setpoint(self):
-            """Ramps a magnet to the setpoint."""
-            command = 'SET:DEV:' + self.axis + ':PSU:ACTN:RTOS'
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-
-            if not response:
-                raise RuntimeWarning("No response after attempting to ramp to set point.")
-
-        def ramp_to_zero(self):
-            """Ramps a magnet from its current magnetic field to zero field."""
-            command = 'SET:DEV:' + self.axis + ':PSU:ACTN:RTOZ'
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-            
-            if not response:
-                raise RuntimeWarning("No response after attempting to ramp to zero.")
-
-        def ramping(self):
-            """Queries if magnet is ramping."""
-            # ask if ramping to zero
-            # command = 'READ:DEV:' + self.axis + ':PSU:ACTN:RTOZ\n'
-            # ask if ramping to set
-            # command = 'READ:DEV:' + self.axis + ':PSU:ACTN:RTOS\n'
-            # TODO: find out what kind of response you expect
-            pass
-
-        def hold(self):
-            """Puts a magnet in a HOLD state.
-            
-            This action does one of the following:
-            1) Stops a ramp
-            2) Allows the field and current to ramp
-            """
-            command = 'SET:DEV:' + self.axis + ':PSU:ACTN:HOLD'
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-
-            if not response:
-                raise RuntimeWarning("No response after telling Mercury iPS to hold.")
-
-        def holding(self):
-            """Queries if magnet is in a HOLD state."""
-            command = 'READ:DEV:' + self.axis + ':PSU:ACTN?'
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-            if response == 'STAT:DEV:'+ self.axis + ':PSU:ACTN:HOLD\n':
-                return True
-            else:
-                return False
-
-        def clamp(self):
-            """Puts a magnet in a CLAMP state."""
-            command = 'SET:DEV:' + self.axis + ':PSU:ACTN:CLMP'
-            response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-
-            if not response:
-                raise RuntimeWarning("No response after telling Mercury iPS to clamp.")
-
-        def clamped(self):
-            """Queries if magnet is in a CLAMP state."""
-            # command = 'READ:DEV:' + self.axis + ':PSU:ACTN:CLMP\n'
-            # response = MercuryIps.Magnet.QUERY_AND_RECEIVE[self.mode](self, command)
-            # TODO: find out what kind of response you expect
-            pass
-		
-
-    def __init__(self, mode='ip',
-                 resource_name=None,
-                 ip_address=None, port=7020, timeout=10.0, bytes_to_read=2048):
+        :param start: First field, in tesla.
+        :param stop: Last field, in tesla.
+        :param points: Number of fields, including both ends.
+        :param step: Spacing between fields, as an alternative to points.
+        :param settle: Extra seconds to wait after each ramp finishes.
+        :param return_to_start: Sweep back down again, for hysteresis.
+        :yield: The field actually reached, in tesla.
         """
-        Parameters:
-        :param str mode: The connection to the iPS, either 'ip' or 'visa'
-        :param str resource_name: VISA resource name of the Mercury iPS
-        :param str ip_address: IP address of the Mercury iPS
-        :param port: Port number of the Mercury iPS
-        :type port: integer
-        :param timeout: Time in seconds to wait for command acknowledgment
-        :type timeout: float
-        :param bytes_to_read: Number of bytes to read from query
-        :type bytes_to_read: integer
+        fields = sweep_values(start, stop, points=points, step=step)
+        if return_to_start:
+            fields = round_trip(fields)
+
+        for field in fields:
+            self.ramp_to_field(field, wait=True)
+            if settle:
+                time.sleep(settle)
+            yield self.field
+
+    def __repr__(self):
+        return f"Magnet({self.axis!r}, field_limit={self.field_limit})"
+
+
+class MercuryIps(MercuryInstrument):
+    """Interface to a Mercury iPS magnet power supply.
+
+        supply = MercuryIps(ip_address="192.168.0.10")
+        supply.z.ramp_to_field(1.0)
+        print(supply.z.field)
+
+    :param axes: Which axes this system has. Defaults to all three.
+    :param field_limits: Field limit in tesla per axis, e.g. {'GRPZ': 9.0}.
+                         Any axis not named keeps its default.
+    """
+
+    def __init__(self, *args, axes=AXES, field_limits=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        limits = dict(DEFAULT_FIELD_LIMITS)
+        limits.update(
+            {str(axis).upper(): value for axis, value in (field_limits or {}).items()}
+        )
+        self.magnets = {
+            str(axis).upper(): Magnet(
+                self, axis, field_limit=limits.get(str(axis).upper())
+            )
+            for axis in axes
+        }
+
+    def _magnet(self, axis):
+        try:
+            return self.magnets[str(axis).upper()]
+        except KeyError:
+            raise RangeError(
+                f"This Mercury iPS has no {axis} axis. It has "
+                f"{', '.join(sorted(self.magnets))}."
+            )
+
+    @property
+    def x(self):
+        """Returns the x-axis magnet."""
+        return self._magnet("GRPX")
+
+    @property
+    def y(self):
+        """Returns the y-axis magnet."""
+        return self._magnet("GRPY")
+
+    @property
+    def z(self):
+        """Returns the z-axis magnet."""
+        return self._magnet("GRPZ")
+
+    @property
+    def magnet_temperature(self):
+        """Returns the temperature of the magnet, in kelvin."""
+        return self.read_value("DEV:MB1.T1:TEMP:SIG:TEMP", "K")
+
+    def hold_all(self):
+        """Hold every axis."""
+        for magnet in self.magnets.values():
+            magnet.hold()
+
+    def ramp_all_to_zero(self, wait=True, timeout=3600.0):
+        """Ramp every axis down to zero field."""
+        for magnet in self.magnets.values():
+            magnet.ramp_to_zero()
+        if wait:
+            for magnet in self.magnets.values():
+                magnet.wait_for_field(timeout=timeout)
+
+    def vector_field(self):
+        """Present field on every axis, as a dict keyed by axis name."""
+        return {axis: magnet.field for axis, magnet in self.magnets.items()}
+
+    def circle_sweep(self, radius, points, plane="xy"):
+        """Generate the field vectors for a circular sweep in one plane.
+
+        Returns the points rather than driving them, so a measurement loop can
+        decide what to do at each one.
+
+        :param radius: Field magnitude in tesla.
+        :param points: How many points around the circle.
+        :param plane: Which two axes to rotate in: 'xy', 'xz' or 'yz'.
+        :return: A list of dicts mapping axis name to field.
         """
-        supported_modes = ('ip', 'visa')
+        plane = str(plane).lower().strip()
+        pairs = {"xy": ("GRPX", "GRPY"), "xz": ("GRPX", "GRPZ"), "yz": ("GRPY", "GRPZ")}
+        if plane not in pairs:
+            raise RangeError(
+                f"The sweep plane can be {', '.join(sorted(pairs))}, but got "
+                f"{plane!r}."
+            )
+        first, second = pairs[plane]
+        for axis in (first, second):
+            magnet = self._magnet(axis)
+            check_range(
+                radius,
+                -magnet.field_limit,
+                magnet.field_limit,
+                f"{axis} field",
+                " T",
+            )
+        if int(points) < 1:
+            raise RangeError(
+                f"A circle sweep needs at least 1 point, but got {points}."
+            )
 
-        if mode.lower().strip() in supported_modes:
-            self.mode = mode
-        else:
-            raise RuntimeError('Mode is not currently supported.')
+        vectors = []
+        for step in range(int(points)):
+            angle = 2 * math.pi * step / int(points)
+            vectors.append(
+                {first: radius * math.cos(angle), second: radius * math.sin(angle)}
+            )
+        return vectors
 
-        self.x_magnet = MercuryIps.Magnet('GRPX', mode=mode, resource_name=resource_name, ip_address=ip_address,
-                                          port=7020, timeout=timeout, bytes_to_read=bytes_to_read)
-        self.y_magnet = MercuryIps.Magnet('GRPY', mode=mode, resource_name=resource_name, ip_address=ip_address,
-                                          port=7020, timeout=timeout, bytes_to_read=bytes_to_read)
-        self.z_magnet = MercuryIps.Magnet('GRPZ', mode=mode, resource_name=resource_name, ip_address=ip_address,
-                                          port=7020, timeout=timeout, bytes_to_read=bytes_to_read)
+    def safe_shutdown(self, timeout=3600.0):
+        """Ramp every axis to zero and leave the supply holding.
 
-    def magnet_temp(self):
-        """Reads magnet temperature"""
-        noun = 'DEV:MB1.T1:TEMP:SIG:TEMP'
-        command = 'READ:' + noun
-        response = QUERY_AND_RECEIVE[self.mode](self, command)
-        return self.extract_value(response, noun, 'K')
-        
-    
-    def circle_sweep(self, field_radius, number_points):
-        pass
+        The state to leave a magnet in when walking away from it.
+        """
+        self.ramp_all_to_zero(wait=True, timeout=timeout)
+        self.hold_all()
+
+    def __repr__(self):
+        return f"MercuryIps({self._transport!r}, axes={sorted(self.magnets)})"
