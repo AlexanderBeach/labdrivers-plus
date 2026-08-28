@@ -40,6 +40,8 @@ class MercuryIpsTeslatron(MercuryIps):
                                state before ramping.
     """
 
+    switch_heater_wait = None
+
     def __init__(
         self,
         *args,
@@ -81,6 +83,14 @@ class MercuryIpsTeslatron(MercuryIps):
 
         Holds the field, turns the switch heater off, waits for the switch to
         go superconducting, then ramps the leads down to zero.
+
+        The leads come down at whatever ramp rate is set at the time, which
+        after a field sweep is the rate that sweep used. Current in the switch
+        is the difference between the magnet current and the supply current, so
+        it is largest just as the leads reach zero, and a switch brought down
+        too fast overheats and quenches. Set current_ramp_rate or
+        field_ramp_rate to a rate the magnet is specified for before calling
+        this.
 
         :param timeout: Seconds to allow for each ramp.
         """

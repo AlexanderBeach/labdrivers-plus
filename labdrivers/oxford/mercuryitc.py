@@ -36,6 +36,9 @@ class MercuryItc(MercuryInstrument):
     :param pressure_board: Board identifier of the needle valve loop.
     """
 
+    pressure_board = None
+    sensors = None
+
     def __init__(
         self, *args, sensors=None, pressure_board=DEFAULT_PRESSURE_BOARD, **kwargs
     ):
@@ -69,8 +72,14 @@ class MercuryItc(MercuryInstrument):
 
     # Temperature
 
-    def temperature(self, sensor):
-        """Read one sensor, in kelvin."""
+    def temperature(self, sensor=None) -> float:
+        """Read one sensor, in kelvin.
+
+        :param sensor: Which sensor. Defaults to the first one configured,
+                       which on a standard system is the VTI.
+        """
+        if sensor is None:
+            sensor = next(iter(self.sensors))
         return self.read_value(self._temperature_noun(sensor, "SIG:TEMP"), "K")
 
     def temperatures(self):
@@ -271,8 +280,14 @@ class MercuryItc(MercuryInstrument):
         :param stop: Last temperature, in kelvin.
         :param points: Number of temperatures, including both ends.
         :param step: Spacing between temperatures, as an alternative to points.
-        :param tolerance: How close counts as settled, as a fraction of target.
-        :param hold: Seconds the temperature must stay within tolerance.
+        :param tolerance: How close counts as settled, as a fraction of the
+                          target rather than an absolute number of kelvin. The
+                          default of 0.05 is a window of 0.075 K at 1.5 K and
+                          15 K at 300 K, so a sweep crossing a wide span wants
+                          a smaller number than one at the bottom of it.
+        :param hold: Seconds the temperature must stay inside that window
+                     before the point counts as reached.
+        :param timeout: Seconds to wait at any one temperature before giving up.
         :yield: The temperature actually reached, in kelvin.
         """
         for target in sweep_values(start, stop, points=points, step=step):

@@ -61,7 +61,7 @@ class Keithley6221(ScpiInstrument):
     source.wave_amplitude = 1e-6
     source.wave_frequency = 17.777
     source.arm_waveform()
-    source.start()
+    source.start_waveform()
     """
 
     IDENTIFIER = "622"
@@ -96,7 +96,7 @@ class Keithley6221(ScpiInstrument):
 
     @property
     def source_current(self):
-        """Returns the dC output current, in amps."""
+        """Returns the DC output current, in amps."""
         return self.query_float("SOUR:CURR?")
 
     @source_current.setter
@@ -703,7 +703,7 @@ class Keithley6221(ScpiInstrument):
         self.write(f"TRAC:POIN {points}")
 
     def read_buffer(self):
-        """Return everything stored in the buffer, as a list of floats."""
+        """Returns everything stored in the buffer, as a list of floats."""
         return self.query_floats("TRAC:DATA?")
 
     def clear_buffer(self):
@@ -746,17 +746,9 @@ class Keithley6221(ScpiInstrument):
         key = check_integer_range(code, 1, 31, "front-panel key code")
         self.write(f"SYST:KEY {key}")
 
-    def press_trigger_key(self):
-        """Press the front-panel TRIG key."""
-        self.press_key(13)
-
-    def press_exit_key(self):
-        """Press the front-panel EXIT key."""
-        self.press_key(11)
-
     @property
     def gpib_address(self):
-        """Returns the gPIB address the instrument reports for itself."""
+        """Returns the GPIB address the instrument reports for itself."""
         return self.query_integer("SYST:COMM:GPIB:ADDR?")
 
     # Common procedures

@@ -392,6 +392,17 @@ def test_configure_sweep_by_step_computes_the_point_count(source):
     assert transport.last_command == ":TRIG:COUN 11"
 
 
+def test_a_step_that_does_not_divide_the_span_counts_what_the_sweep_produces(source):
+    # The staircase walks whole steps out from the start and never reaches the
+    # stop unless the step divides the span exactly. Counting the stop as well
+    # leaves the trigger layer waiting for a level that never arrives, so the
+    # sweep either wraps to an extra point or sits waiting.
+    instrument, transport = source
+    assert instrument.configure_sweep(0, 1, step=0.3) == 4
+    assert transport.last_command == ":TRIG:COUN 4"
+    assert instrument.configure_sweep(0, 1, step=0.25) == 5
+
+
 def test_configure_sweep_needs_exactly_one_of_points_or_step(source):
     instrument, _ = source
     with pytest.raises(RangeError, match="either points= or step="):

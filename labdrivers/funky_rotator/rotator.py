@@ -14,6 +14,8 @@ Specifications, from the vendor manual (Rotation Probe User's Manual v2.2):
 
 import time
 
+from ..core import Settings
+from ..core.errors import InstrumentTimeoutError, RangeError
 from ..core.sweep import round_trip, sweep_values
 from .wj_api import USB_PORT, WJApi
 
@@ -39,7 +41,7 @@ DEFAULT_MOVE_TIMEOUT = 600.0
 DEGREE = "°"
 
 
-class Rotator:
+class Rotator(Settings):
     """Interface to a Fangcun Keyi rotation probe.
 
     :param axis: Controller axis the probe is wired to (default: 1).
@@ -59,7 +61,7 @@ class Rotator:
         strict=False,
     ):
         if float(pulses_per_revolution) <= 0:
-            raise RuntimeError(
+            raise RangeError(
                 "The number of pulses per revolution must be a positive number, "
                 f"but got {pulses_per_revolution}."
             )
@@ -72,7 +74,7 @@ class Rotator:
         self._api.close()
         self._api.open(port)
 
-        self._axis = self._api._check_axis(axis)
+        self._axis = self._api.check_axis(axis)
 
     # Unit conversion
 
@@ -87,7 +89,7 @@ class Rotator:
     def _check_angle(self, angle):
         """Reject any angle outside the probe's mechanical travel."""
         if not MINIMUM_ANGLE <= float(angle) <= MAXIMUM_ANGLE:
-            raise RuntimeError(
+            raise RangeError(
                 f"The angle must be between {MINIMUM_ANGLE}{DEGREE} and "
                 f"{MAXIMUM_ANGLE}{DEGREE}, but got {angle}{DEGREE}. Exceeding "
                 "range can damage the probe."
@@ -159,12 +161,13 @@ class Rotator:
         :param poll_interval: Seconds between status reads (default: 0.5).
         :param timeout: Seconds to wait before giving up (default: 600).
         :param progress: Print a live position line while waiting.
-        :raises RuntimeError: If the probe is still moving after the timeout.
+        :raises InstrumentTimeoutError: If the probe is still moving after
+                                        the timeout.
         """
         deadline = time.monotonic() + float(timeout)
         while self.is_moving:
             if time.monotonic() > deadline:
-                raise RuntimeError(
+                raise InstrumentTimeoutError(
                     f"The probe was still moving after {timeout} s, at "
                     f"{self.angle:.2f}{DEGREE}. Check that nothing is obstructing "
                     "it, then stop it with emergency_stop()."
@@ -205,9 +208,10 @@ class Rotator:
         if int(value) >= 1:
             self._api.set_axis_velocity(self._axis, int(value))
         else:
-            raise RuntimeError(
-                "The speed must be an integer of 1 or greater, where 1 is about "
-                f"1.8{DEGREE}/s. The manual recommends 1 to 3."
+            raise RangeError(
+                "The speed must be a whole number of 1 or greater, where 1 is "
+                f"about 1.8{DEGREE}/s and the manual recommends 1 to 3, but got "
+                f"{value!r}."
             )
 
     @property

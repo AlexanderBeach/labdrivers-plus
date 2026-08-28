@@ -27,7 +27,7 @@ from ..core import (
     check_range,
     nearest_allowed,
 )
-from ..core.errors import RangeError
+from ..core.errors import InstrumentError, RangeError
 
 MAXIMUM_CHANNELS = 16
 MAXIMUM_TRACES = 16
@@ -127,7 +127,12 @@ class Vna(ScpiInstrument):
     :param maximum_frequency: Highest frequency this analyzer reaches.
     """
 
+    # No identifier, because this driver covers Copper Mountain and Keysight
+    # analyzers and their *IDN? replies share nothing to match on.
     IDENTIFIER = None
+
+    maximum_frequency = None
+    minimum_frequency = None
 
     def __init__(
         self,
@@ -189,12 +194,12 @@ class Vna(ScpiInstrument):
         self.write(f":SENS{self._channel}:FREQ:STOP {value}")
 
     @property
-    def centre_frequency(self):
+    def center_frequency(self):
         """Returns the center of the sweep, in hertz."""
         return self.query_float(f":SENS{self._channel}:FREQ:CENT?")
 
-    @centre_frequency.setter
-    def centre_frequency(self, value):
+    @center_frequency.setter
+    def center_frequency(self, value):
         self._check_frequency(value, "center frequency")
         self.write(f":SENS{self._channel}:FREQ:CENT {value}")
 
@@ -236,7 +241,7 @@ class Vna(ScpiInstrument):
 
     @property
     def if_bandwidth(self):
-        """Returns the iF bandwidth, in hertz.
+        """Returns the IF bandwidth, in hertz.
 
         Narrowing this is the main lever on the noise floor: each factor of ten
         buys about 10 dB, and costs the same factor in sweep time.
@@ -245,7 +250,6 @@ class Vna(ScpiInstrument):
 
     @if_bandwidth.setter
     def if_bandwidth(self, value):
-        check_range(value, IF_BANDWIDTHS[0], IF_BANDWIDTHS[-1], "IF bandwidth", " Hz")
         # The analyzer only offers a 1/1.5/2/3/5/7 ladder, so an arbitrary
         # value would be silently rounded to one of these anyway.
         _, bandwidth = nearest_allowed(value, IF_BANDWIDTHS, "IF bandwidth", " Hz")
@@ -315,7 +319,7 @@ class Vna(ScpiInstrument):
         if stop is not None:
             self.stop_frequency = stop
         if center is not None:
-            self.centre_frequency = center
+            self.center_frequency = center
         if span is not None:
             self.span = span
         if points is not None:
@@ -390,13 +394,12 @@ class Vna(ScpiInstrument):
     def autoscale(self, trace=None):
         """Scale a trace to fit the display, or every trace if none is given."""
         if trace is None:
-            for number in range(1, self.trace_count + 1):
-                self.select_trace(number)
-                self.write(f":DISP:WIND{self._channel}:TRAC{number}:Y:AUTO")
-            return
-        number = self._check_trace(trace)
-        self.select_trace(number)
-        self.write(f":DISP:WIND{self._channel}:TRAC{number}:Y:AUTO")
+            numbers = range(1, self.trace_count + 1)
+        else:
+            numbers = [self._check_trace(trace)]
+        for number in numbers:
+            self.select_trace(number)
+            self.write(f":DISP:WIND{self._channel}:TRAC{number}:Y:AUTO")
 
     # Reading data
 
@@ -418,8 +421,16 @@ class Vna(ScpiInstrument):
         frequencies = self.frequencies()
 
         # Formatted data carries two numbers per point, the second of which is
-        # zero for every format that has only one axis.
+        # zero for every format that has only one axis. Smith and polar traces
+        # use both, and handing back the first alone would be half of the
+        # measurement presented as all of it.
         if len(values) == 2 * len(frequencies):
+            if any(second != 0.0 for second in values[1::2]):
+                raise InstrumentError(
+                    "This trace is in a format with two numbers to a point, "
+                    "such as Smith or polar, and read_trace returns one number "
+                    "a point. Use read_complex_trace for it."
+                )
             values = values[0::2]
         return frequencies, values
 

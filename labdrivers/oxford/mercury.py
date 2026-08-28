@@ -50,6 +50,19 @@ class MercuryInstrument(Instrument):
         """
         return self.query(f"READ:{noun}")
 
+    def is_responding(self):
+        """Returns True if the controller answers.
+
+        Asked rather than assumed. These speak a line protocol of their own
+        instead of SCPI, so the check they would otherwise inherit only reports
+        whether a socket object exists, and a controller switched off at the
+        wall goes on looking healthy for as long as the server is left running.
+        """
+        try:
+            return bool(self.query("READ:SYS:CAT"))
+        except Exception:
+            return False
+
     def read_value(self, noun, unit=""):
         """Read a numeric signal and return it as a float.
 

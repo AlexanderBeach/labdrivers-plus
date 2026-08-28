@@ -141,7 +141,7 @@ class WJApi:
     # Call helpers
 
     def _call(self, name, *args):
-        """Invoke a bound function, honouring the strict-checking setting."""
+        """Invoke a bound function, honoring the strict-checking setting."""
         code = getattr(self._dll, name)(*args)
         if self.strict and code != 0:
             raise WJApiError(f"{name}{args} returned {code}.")
@@ -173,7 +173,7 @@ class WJApi:
                 buffer[index] = int(value)
         return buffer
 
-    def _check_axis(self, axis):
+    def check_axis(self, axis):
         if not 1 <= int(axis) <= self.axis_count:
             raise RuntimeError(
                 f"The axis must be an integer from 1 to {self.axis_count} on "
@@ -209,19 +209,19 @@ class WJApi:
 
     def get_axis_acceleration(self, axis):
         """Returns the acceleration setting of one axis, in controller units."""
-        return self._call_out("WJ_Get_Axis_Acc", self._check_axis(axis))
+        return self._call_out("WJ_Get_Axis_Acc", self.check_axis(axis))
 
     def get_axis_deceleration(self, axis):
         """Returns the deceleration setting of one axis, in controller units."""
-        return self._call_out("WJ_Get_Axis_Dec", self._check_axis(axis))
+        return self._call_out("WJ_Get_Axis_Dec", self.check_axis(axis))
 
     def get_axis_velocity(self, axis):
         """Returns the velocity setting of one axis, in controller units."""
-        return self._call_out("WJ_Get_Axis_Vel", self._check_axis(axis))
+        return self._call_out("WJ_Get_Axis_Vel", self.check_axis(axis))
 
     def get_axis_subdivision(self, axis):
         """Returns the microstepping subdivision setting of one axis."""
-        return self._call_out("WJ_Get_Axis_Subdivision", self._check_axis(axis))
+        return self._call_out("WJ_Get_Axis_Subdivision", self.check_axis(axis))
 
     def get_axis_status(self, axis):
         """Returns the raw status word of one axis.
@@ -229,7 +229,7 @@ class WJApi:
         The vendor does not document the bit layout. Empirically, 0 means the
         axis is idle and a nonzero value means it is moving.
         """
-        return self._call_out("WJ_Get_Axis_Status", self._check_axis(axis))
+        return self._call_out("WJ_Get_Axis_Status", self.check_axis(axis))
 
     def get_axes_status(self):
         """Returns the raw status word of every axis, as a list."""
@@ -239,7 +239,7 @@ class WJApi:
 
     def get_axis_pulses(self, axis):
         """Returns the absolute pulse position of one axis."""
-        return self._call_out("WJ_Get_Axis_Pulses", self._check_axis(axis))
+        return self._call_out("WJ_Get_Axis_Pulses", self.check_axis(axis))
 
     def get_axes_pulses(self):
         """Returns the absolute pulse position of every axis, as a list."""
@@ -255,7 +255,7 @@ class WJApi:
 
     def move_axis_pulses(self, axis, pulses):
         """Move one axis by a relative number of pulses (may be negative)."""
-        return self._call("WJ_Move_Axis_Pulses", self._check_axis(axis), int(pulses))
+        return self._call("WJ_Move_Axis_Pulses", self.check_axis(axis), int(pulses))
 
     def move_axes_pulses(self, pulses):
         """Move every axis by a relative number of pulses.
@@ -266,7 +266,7 @@ class WJApi:
 
     def move_axis_velocity(self, axis, velocity):
         """Run one axis continuously at the given velocity."""
-        return self._call("WJ_Move_Axis_Vel", self._check_axis(axis), int(velocity))
+        return self._call("WJ_Move_Axis_Vel", self.check_axis(axis), int(velocity))
 
     def move_axes_velocity(self, velocities):
         """Run every axis continuously, one velocity per axis in axis order."""
@@ -274,37 +274,37 @@ class WJApi:
 
     def emergency_stop(self, axis):
         """Stop one axis immediately, without a deceleration ramp."""
-        return self._call("WJ_Move_Axis_Emergency_Stop", self._check_axis(axis))
+        return self._call("WJ_Move_Axis_Emergency_Stop", self.check_axis(axis))
 
     def slow_stop(self, axis):
         """Stop one axis using its configured deceleration ramp."""
-        return self._call("WJ_Move_Axis_Slow_Stop", self._check_axis(axis))
+        return self._call("WJ_Move_Axis_Slow_Stop", self.check_axis(axis))
 
     def move_axis_home(self, axis, value):
         """Send one axis to its home position."""
-        return self._call("WJ_Move_Axis_Home", self._check_axis(axis), int(value))
+        return self._call("WJ_Move_Axis_Home", self.check_axis(axis), int(value))
 
     # Settings
 
     def set_axis_acceleration(self, axis, value):
         """Set the acceleration of one axis, in controller units."""
-        return self._call("WJ_Set_Axis_Acc", self._check_axis(axis), int(value))
+        return self._call("WJ_Set_Axis_Acc", self.check_axis(axis), int(value))
 
     def set_axis_deceleration(self, axis, value):
         """Set the deceleration of one axis, in controller units."""
-        return self._call("WJ_Set_Axis_Dec", self._check_axis(axis), int(value))
+        return self._call("WJ_Set_Axis_Dec", self.check_axis(axis), int(value))
 
     def set_axis_velocity(self, axis, value):
         """Set the velocity of one axis, in controller units."""
-        return self._call("WJ_Set_Axis_Vel", self._check_axis(axis), int(value))
+        return self._call("WJ_Set_Axis_Vel", self.check_axis(axis), int(value))
 
     def set_axis_subdivision(self, axis, value):
         """Set the microstepping subdivision of one axis."""
-        return self._call("WJ_Set_Axis_Subdivision", self._check_axis(axis), int(value))
+        return self._call("WJ_Set_Axis_Subdivision", self.check_axis(axis), int(value))
 
     def set_axis_slow_stop(self, axis, value):
         """Configure the slow-stop deceleration behavior of one axis."""
-        return self._call("WJ_Set_Axis_Slow_Stop", self._check_axis(axis), int(value))
+        return self._call("WJ_Set_Axis_Slow_Stop", self.check_axis(axis), int(value))
 
     def set_led_twinkle(self):
         """Blink the controller's front-panel LED, to identify the unit."""
@@ -312,7 +312,7 @@ class WJApi:
 
     def set_axis_pulses_zero(self, axis):
         """Define the current position of one axis as pulse zero."""
-        return self._call("WJ_Set_Axis_Pulses_Zero", self._check_axis(axis))
+        return self._call("WJ_Set_Axis_Pulses_Zero", self.check_axis(axis))
 
     def set_default(self):
         """Restore the controller's factory default settings."""
@@ -320,13 +320,11 @@ class WJApi:
 
     def set_move_axis_velocity_acceleration(self, axis, value):
         """Set the combined move velocity/acceleration profile of one axis."""
-        return self._call(
-            "WJ_Set_Move_Axis_Vel_Acc", self._check_axis(axis), int(value)
-        )
+        return self._call("WJ_Set_Move_Axis_Vel_Acc", self.check_axis(axis), int(value))
 
     def set_axis_home_pulses(self, axis, value):
         """Set the pulse position that one axis treats as home."""
-        return self._call("WJ_Set_Axis_Home_Pulses", self._check_axis(axis), int(value))
+        return self._call("WJ_Set_Axis_Home_Pulses", self.check_axis(axis), int(value))
 
     # Digital IO
 

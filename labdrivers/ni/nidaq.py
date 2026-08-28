@@ -13,7 +13,13 @@ import math
 import statistics
 import time
 
-from ..core import check_boolean, check_choice, check_integer_range, check_range
+from ..core import (
+    Settings,
+    check_boolean,
+    check_choice,
+    check_integer_range,
+    check_range,
+)
 from ..core.errors import ConnectionFailure, RangeError
 
 # NI's analog input terminal configurations.
@@ -41,7 +47,7 @@ def _nidaqmx():
     return nidaqmx
 
 
-class Nidaq:
+class Nidaq(Settings):
     """Interface to a National Instruments DAQ device.
 
         daq = Nidaq("Dev1")
@@ -50,6 +56,8 @@ class Nidaq:
 
     :param device: Device name as it appears in NI MAX, e.g. 'Dev1'.
     """
+
+    device = None
 
     def __init__(self, device=DEFAULT_DEVICE):
         self.device = str(device)
@@ -75,11 +83,7 @@ class Nidaq:
         return self._nidaqmx.Task()
 
     def _terminal_configuration(self, name):
-        code = check_choice(
-            name,
-            {value: value for value in TERMINAL_CONFIGURATIONS},
-            "terminal configuration",
-        )
+        code = check_choice(name, TERMINAL_CONFIGURATIONS, "terminal configuration")
         constants = self._nidaqmx.constants.TerminalConfiguration
         return {
             "default": constants.DEFAULT,

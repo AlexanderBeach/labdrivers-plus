@@ -58,7 +58,13 @@ def sweep_values(start, stop, points=None, step=None, spacing="linear"):
             values.append(stop)
         return values
 
-    count = int(points)
+    try:
+        wanted = float(points)
+    except (TypeError, ValueError):
+        raise RangeError(f"A sweep needs a whole number of points, but got {points!r}.")
+    count = int(wanted)
+    if count != wanted:
+        raise RangeError(f"A sweep needs a whole number of points, but got {points!r}.")
     if count < 2:
         raise RangeError(f"A sweep needs at least 2 points, but got {points}.")
 

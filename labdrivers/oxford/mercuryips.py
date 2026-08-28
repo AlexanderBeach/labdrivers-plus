@@ -14,12 +14,24 @@ Commands are transcribed from the *Mercury iPS Operator's Manual* (issue 20).
 import math
 import time
 
-from ..core import check_boolean, check_choice, check_range
-from ..core.errors import RangeError
+from ..core import Settings, check_boolean, check_choice, check_range
+from ..core.errors import InstrumentError, RangeError
 from ..core.sweep import round_trip, sweep_values
 from .mercury import MercuryInstrument
 
 AXES = ("GRPX", "GRPY", "GRPZ")
+
+
+def axis_name(axis):
+    """Returns the board name of an axis, from either spelling.
+
+    The boards are called GRPX, GRPY and GRPZ, and the properties that reach
+    them are x, y and z, so a caller naming an axis has two reasonable spellings
+    to choose from and both mean the same magnet.
+    """
+    text = str(axis).strip().upper()
+    return text if text.startswith("GRP") else "GRP" + text
+
 
 # Field limits in tesla per axis. Override with field_limits= for a different
 # magnet. These are only a sensible starting point.
@@ -36,7 +48,7 @@ ACTIONS = {
 }
 
 
-class Magnet:
+class Magnet(Settings):
     """One axis of a Mercury iPS.
 
     :param instrument: The MercuryIps this axis belongs to.
@@ -44,6 +56,10 @@ class Magnet:
     :param field_limit: Largest field this magnet may be asked for, in tesla.
     :param current_limit: Largest current this magnet may be asked for, in amps.
     """
+
+    axis = None
+    current_limit = None
+    field_limit = None
 
     def __init__(
         self, instrument, axis, field_limit=None, current_limit=DEFAULT_CURRENT_LIMIT
@@ -140,6 +156,20 @@ class Magnet:
         return self._instrument.read_value(self._noun("SIG:VOLT"), "V")
 
     # Switch heater
+
+    def _switch_heater_word(self):
+        """Returns what the supply says about the switch heater, in upper case.
+
+        Empty when it says nothing recognizable, which is what a magnet with no
+        persistent switch fitted does. A sweep refuses to start on a definite
+        OFF rather than on anything that merely is not ON, so a system that
+        cannot answer the question is left alone.
+        """
+        try:
+            reply = self._instrument.read_noun(self._noun("SIG:SWHT"))
+            return str(self._instrument.parse_word(reply, "SWHT")).strip().upper()
+        except InstrumentError:
+            return ""
 
     @property
     def switch_heater(self):
@@ -245,6 +275,13 @@ class Magnet:
         if return_to_start:
             fields = round_trip(fields)
 
+        if self._switch_heater_word() == "OFF":
+            raise InstrumentError(
+                f"The {self.axis} switch heater is closed, so the field cannot "
+                f"follow a setpoint and the sweep would return the same value "
+                f"at every point. Open it with switch_heater = True first."
+            )
+
         for field in fields:
             self.ramp_to_field(field, wait=True)
             if settle:
@@ -267,22 +304,22 @@ class MercuryIps(MercuryInstrument):
                          Any axis not named keeps its default.
     """
 
+    magnets = None
+
     def __init__(self, *args, axes=AXES, field_limits=None, **kwargs):
         super().__init__(*args, **kwargs)
         limits = dict(DEFAULT_FIELD_LIMITS)
         limits.update(
-            {str(axis).upper(): value for axis, value in (field_limits or {}).items()}
+            {axis_name(axis): value for axis, value in (field_limits or {}).items()}
         )
-        self.magnets = {
-            str(axis).upper(): Magnet(
-                self, axis, field_limit=limits.get(str(axis).upper())
-            )
-            for axis in axes
-        }
+        self.magnets = {}
+        for axis in axes:
+            name = axis_name(axis)
+            self.magnets[name] = Magnet(self, name, field_limit=limits.get(name))
 
     def _magnet(self, axis):
         try:
-            return self.magnets[str(axis).upper()]
+            return self.magnets[axis_name(axis)]
         except KeyError:
             raise RangeError(
                 f"This Mercury iPS has no {axis} axis. It has "
@@ -290,17 +327,17 @@ class MercuryIps(MercuryInstrument):
             )
 
     @property
-    def x(self):
+    def x(self) -> Magnet:
         """Returns the x-axis magnet."""
         return self._magnet("GRPX")
 
     @property
-    def y(self):
+    def y(self) -> Magnet:
         """Returns the y-axis magnet."""
         return self._magnet("GRPY")
 
     @property
-    def z(self):
+    def z(self) -> Magnet:
         """Returns the z-axis magnet."""
         return self._magnet("GRPZ")
 
@@ -323,7 +360,7 @@ class MercuryIps(MercuryInstrument):
                 magnet.wait_for_field(timeout=timeout)
 
     def vector_field(self):
-        """Present field on every axis, as a dict keyed by axis name."""
+        """Returns the present field on every axis, as a dict keyed by axis name."""
         return {axis: magnet.field for axis, magnet in self.magnets.items()}
 
     def circle_sweep(self, radius, points, plane="xy"):

@@ -4,13 +4,22 @@ Every setter in this package validates its argument and, on rejection, raises
 with a sentence naming what was wrong and what the instrument will accept.
 For example::
 
-    The wave amplitude must be between 2E-12 A and 105E-3 A, but got 1 A.
+    The waveform amplitude must be between 2e-12 A and 0.105 A, but got 1 A.
 
 Using them keeps that message identical across every instrument, and keeps a
 setter down to one line.
 """
 
 from .errors import RangeError
+
+
+def describe_range(minimum, maximum, unit):
+    """Returns how a range should be worded, including when one end is open."""
+    if minimum == float("-inf"):
+        return f"at most {maximum}{unit}"
+    if maximum == float("inf"):
+        return f"at least {minimum}{unit}"
+    return f"between {minimum}{unit} and {maximum}{unit}"
 
 
 def check_range(value, minimum, maximum, name, unit=""):
@@ -28,12 +37,12 @@ def check_range(value, minimum, maximum, name, unit=""):
         number = float(value)
     except (TypeError, ValueError):
         raise RangeError(
-            f"The {name} must be a number between {minimum}{unit} and "
-            f"{maximum}{unit}, but got {value!r}."
+            f"The {name} must be a number {describe_range(minimum, maximum, unit)}, "
+            f"but got {value!r}."
         )
     if not minimum <= number <= maximum:
         raise RangeError(
-            f"The {name} must be between {minimum}{unit} and {maximum}{unit}, "
+            f"The {name} must be {describe_range(minimum, maximum, unit)}, "
             f"but got {value}{unit}."
         )
     return number
@@ -51,12 +60,12 @@ def check_integer_range(value, minimum, maximum, name, unit=""):
             raise ValueError
     except (TypeError, ValueError):
         raise RangeError(
-            f"The {name} must be a whole number between {minimum}{unit} and "
-            f"{maximum}{unit}, but got {value!r}."
+            f"The {name} must be a whole number "
+            f"{describe_range(minimum, maximum, unit)}, but got {value!r}."
         )
     if not minimum <= number <= maximum:
         raise RangeError(
-            f"The {name} must be between {minimum}{unit} and {maximum}{unit}, "
+            f"The {name} must be {describe_range(minimum, maximum, unit)}, "
             f"but got {value}{unit}."
         )
     return number
@@ -76,6 +85,10 @@ def check_choice(value, choices, name):
         lookup[str(choice).strip().lower()] = choice
 
     key = str(value).strip().lower()
+    if key not in lookup and isinstance(value, float) and value.is_integer():
+        # 12 and 12.0 name the same choice, and a value worked out in a notebook
+        # arrives as whichever the arithmetic happened to produce.
+        key = str(int(value))
     if key not in lookup:
         quoted = [f"'{choice}'" for choice in choices]
         accepted = (
@@ -126,9 +139,15 @@ def nearest_allowed(value, allowed, name, unit=""):
     constants and sensitivities are both like this, so asking for 47 ms should
     select the 30 ms setting rather than fail.
 
+    A value outside the ladder altogether is refused rather than snapped. The
+    nearest setting to 500 on a ladder ending at 1 is 1, and a sensitivity
+    meant as 500 nV would quietly have become 1 V, two million times what was
+    asked for, with the measurement carrying on as though nothing happened.
+
     :param allowed: Sequence of the values the instrument actually supports.
     :return: A tuple of (index of the chosen setting, the chosen value).
-    :raises RangeError: If the value is not a number, or the list is empty.
+    :raises RangeError: If the value is not a number, the list is empty, or the
+                        value lies outside the ladder.
     """
     if not allowed:
         raise RangeError(f"No settings are available for the {name}.")
@@ -136,6 +155,13 @@ def nearest_allowed(value, allowed, name, unit=""):
         number = float(value)
     except (TypeError, ValueError):
         raise RangeError(f"The {name} must be a number, but got {value!r}.")
+
+    smallest, largest = min(allowed), max(allowed)
+    if not smallest <= number <= largest:
+        raise RangeError(
+            f"The {name} must be between {smallest}{unit} and {largest}{unit}, "
+            f"but got {value}{unit}."
+        )
 
     index = min(range(len(allowed)), key=lambda i: abs(float(allowed[i]) - number))
     return index, allowed[index]

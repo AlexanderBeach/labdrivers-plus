@@ -3,9 +3,10 @@
 A transport moves strings to and from a device and knows nothing about what
 they mean. Drivers own the command language, and transports own the wire.
 
-Three transports are provided. VISA covers GPIB, USB, serial and TCPIP, a raw
-TCP socket covers the Oxford cryogenics controllers, and a recording double
-stands in for an instrument when there is no hardware to talk to.
+Four transports are provided. VISA covers GPIB, USB, serial and TCPIP, a raw
+TCP socket covers the Oxford cryogenics controllers, a recording double stands
+in for an instrument when there is no hardware to talk to, and a remote
+transport forwards to a labdrivers server that holds the connection open.
 :func:`open_transport` picks between them using the arguments a driver was
 constructed with.
 
@@ -14,16 +15,49 @@ milliseconds internally, but that conversion happens here, once, rather than
 in each driver.
 """
 
+import json
 import logging
 import socket
+import urllib.error
+import urllib.parse
+import urllib.request
 
-from .errors import ConnectionFailure, InstrumentTimeoutError
+from .errors import ConnectionFailure, InstrumentError, InstrumentTimeoutError
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_SOCKET_PORT = 7020
 DEFAULT_BYTES_TO_READ = 2048
+
+# Where a RemoteTransport looks for a server, written as an address rather than
+# a name. "localhost" resolves to ::1 before 127.0.0.1 on Windows, the server
+# binds IPv4, and urllib tries one family at a time, so with the name every
+# command waits out a failed IPv6 connection first, at two seconds each against
+# two milliseconds here.
+DEFAULT_SERVER = "127.0.0.1:8000"
+
+
+def as_address(server):
+    """Returns the server with the name localhost written out as 127.0.0.1.
+
+    The name resolves to ::1 before 127.0.0.1 on Windows while the server binds
+    IPv4, and urllib tries one family at a time, so with the name every command
+    waits out a failed IPv6 connection first, at two seconds each against two
+    milliseconds for the address. Only the host itself is rewritten, so names
+    that merely contain the word, such as cryo.localhost, are left alone.
+    """
+    text = str(server)
+    scheme, mark, rest = text.rpartition("://")
+    host, slash, tail = rest.partition("/")
+    name, colon, port = host.rpartition(":")
+    if not colon:
+        name, port = host, ""
+    if name == "localhost":
+        name = "127.0.0.1"
+    host = name + colon + port if colon else name
+    return scheme + mark + host + slash + tail
+
 
 # One resource manager is shared by every VISA transport, created on first use.
 # It must not be built at import time: constructing it loads the NI VISA driver,
@@ -102,15 +136,15 @@ class Transport:
 class VisaTransport(Transport):
     """Talks to an instrument through pyvisa.
 
-        Covers GPIB, USB, serial and TCPIP alike, and the resource name decides which
-    of them is used.
+    Covers GPIB, USB, serial and TCPIP alike, and the resource name decides
+    which of them is used.
 
-        :param resource_name: VISA resource string, e.g. 'GPIB0::24::INSTR'.
-        :param timeout: Seconds to wait for a reply (default: 10).
-        :param read_termination: Character ending a reply, if the instrument needs
-                                 one set explicitly (the Oxford ITC 503 wants '\\r').
-        :param write_termination: Character appended to each command.
-        :param baud_rate: Serial line speed, for RS-232 resources.
+    :param resource_name: VISA resource string, e.g. 'GPIB0::24::INSTR'.
+    :param timeout: Seconds to wait for a reply (default: 10).
+    :param read_termination: Character ending a reply, if the instrument needs
+                             one set explicitly (the Oxford ITC 503 wants '\\r').
+    :param write_termination: Character appended to each command.
+    :param baud_rate: Serial line speed, for RS-232 resources.
     """
 
     def __init__(
@@ -209,8 +243,8 @@ class SocketTransport(Transport):
 
     The socket is opened on first use and kept open, reconnecting if the far end
     drops it. Replies are read until the terminator arrives rather than taking
-    whatever a single recv() happens to return, which is what truncated long
-    replies before.
+    whatever a single recv() happens to return, because one recv() can hand back
+    half of a long reply.
 
     :param ip_address: Address of the instrument.
     :param port: TCP port. The Mercury uses 7020 and the Triton uses 33576.
@@ -273,7 +307,15 @@ class SocketTransport(Transport):
                     f"{self.timeout} s."
                 )
             if not chunk:
-                break
+                # The far end closed. Whatever arrived is part of a reply, not
+                # all of one, and returning it would hand a driver a number
+                # that parses and is wrong.
+                partial = b"".join(chunks).decode(self.encoding, "replace").strip()
+                self.close()
+                raise ConnectionFailure(
+                    f"{self.address[0]}:{self.address[1]} closed the connection "
+                    f"partway through a reply. What arrived was {partial!r}."
+                )
             chunks.append(chunk)
             if chunks and b"".join(chunks).endswith(self.terminator.encode()):
                 break
@@ -377,7 +419,7 @@ class RecordingTransport(Transport):
 
     @property
     def writes(self):
-        """Returns the only the commands that set something, ignoring queries.
+        """Returns only the commands that set something, ignoring queries.
 
         Useful for asserting the exact sequence a configuration step emits,
         without the interleaved queries a driver makes to find out what state
@@ -391,7 +433,7 @@ class RecordingTransport(Transport):
 
     @property
     def queries(self):
-        """Returns the only the commands that asked the instrument something."""
+        """Returns only the commands that asked the instrument something."""
         return [
             command
             for command, kind in zip(self.commands, self._kinds)
@@ -405,6 +447,133 @@ class RecordingTransport(Transport):
 
     def __repr__(self):
         return f"RecordingTransport({len(self.commands)} commands)"
+
+
+class RemoteTransport(Transport):
+    """Talks to an instrument that a labdrivers server holds open.
+
+    The server owns the real connection and this forwards each command to it
+    over HTTP, so a driver built on one behaves exactly like a driver built on
+    a VisaTransport. That is what lets a notebook keep working across kernel
+    restarts, and lets two people use one cryostat at once.
+
+    Only the standard library is used, so a machine running measurements needs
+    nothing installed beyond labdrivers itself.
+
+        lockin = Sr830(transport=RemoteTransport("lockin", "cryostat-pc:8000"))
+
+    :param name: Name the instrument is registered under on the server.
+    :param server: Host and port, with or without a scheme.
+    :param timeout: Seconds to wait for the server, which is separate from the
+                    server's own timeout talking to the instrument.
+    """
+
+    def __init__(self, name, server=DEFAULT_SERVER, timeout=DEFAULT_TIMEOUT):
+        self.name = str(name)
+        # Quoted once here. An instrument called "probe 1" or "dewar 2" is
+        # ordinary, and an unquoted space makes urllib raise InvalidURL from
+        # underneath this class where nothing catches it.
+        self._path = urllib.parse.quote(self.name, safe="")
+        # Written as an address even when somebody typed the name, for the
+        # reason in DEFAULT_SERVER above. Only the host itself is rewritten, so
+        # a real hostname such as cryo.localhost resolves normally.
+        address = as_address(server)
+        self.server = address if "://" in address else f"http://{address}"
+        self.timeout = float(timeout)
+        self._open = True
+
+    def _send(self, payload):
+        """Post one operation to the server and return the reply it carries.
+
+        The payload carries this transport's timeout so the server gives up on
+        a busy instrument before this end does. That covers waiting for the
+        lock, so a command that gave up queueing never reached the instrument.
+        It does not cover the instrument taking longer to answer than the
+        timeout allows, and in that case the command has been sent and may well
+        have run, so a retry can apply it twice.
+        """
+        if not self._open:
+            raise ConnectionFailure(
+                f"This connection to '{self.name}' has been closed. Get another "
+                f"with labdrivers.client.connect."
+            )
+        payload = dict(payload, timeout=self.timeout)
+        url = f"{self.server}/api/instruments/{self._path}/io"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                # So the server can say which machines are using an instrument
+                # by name, which is what somebody deciding whether to take it
+                # over actually wants to know.
+                "X-Labdrivers-Client": socket.gethostname(),
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                answer = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")
+            raise ConnectionFailure(
+                f"The server rejected a command for '{self.name}': {detail}"
+            )
+        except urllib.error.URLError as error:
+            raise ConnectionFailure(
+                f"No labdrivers server answered at {self.server}. Start one with "
+                f"'labdrivers-server', or pass server= if it runs elsewhere. The "
+                f"underlying error was {error.reason}."
+            )
+        except TimeoutError:
+            raise InstrumentTimeoutError(
+                f"The server at {self.server} did not answer within "
+                f"{self.timeout} s. If '{self.name}' was still working, the "
+                f"command may have run, so check before sending it again."
+            )
+
+        if answer.get("error") is not None:
+            raise InstrumentError(answer["error"], instrument=self.name)
+        return answer.get("reply")
+
+    def write(self, command):
+        """Send a command that expects no reply."""
+        self._send({"kind": "write", "command": str(command)})
+
+    def read(self):
+        """Read one reply."""
+        return self._send({"kind": "read"})
+
+    def query(self, command):
+        """Send a command and return its reply."""
+        return self._send({"kind": "query", "command": str(command)})
+
+    def query_binary(self, command, datatype="B", is_big_endian=False):
+        """Send a command and read back a binary block, as a list of numbers."""
+        return self._send(
+            {
+                "kind": "query_binary",
+                "command": str(command),
+                "datatype": datatype,
+                "is_big_endian": bool(is_big_endian),
+            }
+        )
+
+    def close(self):
+        """Stop using the server.
+
+        The instrument itself stays open, because the server owns it and other
+        clients may still be using it. Release it there instead, from the web
+        page or with labdrivers.client.Server.remove.
+        """
+        self._open = False
+
+    @property
+    def is_open(self):
+        """Returns True while this transport will still send commands."""
+        return self._open
+
+    def __repr__(self):
+        return f"RemoteTransport({self.name!r}, {self.server!r})"
 
 
 def open_transport(

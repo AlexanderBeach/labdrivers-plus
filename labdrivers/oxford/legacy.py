@@ -80,5 +80,18 @@ class OxfordLegacyInstrument(Instrument):
         self.command("C", code)
 
     def version(self):
-        """Return the controller's firmware version string (``V``)."""
+        """Returns the controller's firmware version string (``V``)."""
         return self.query("V").strip()
+
+    def is_responding(self):
+        """Returns True if the controller answers ``V``.
+
+        Asked rather than assumed. These speak single letters rather than SCPI,
+        so the check they would otherwise inherit only reports whether a handle
+        exists, and a controller switched off at the wall goes on looking
+        healthy.
+        """
+        try:
+            return bool(self.version())
+        except Exception:
+            return False

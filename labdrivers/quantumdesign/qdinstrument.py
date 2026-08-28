@@ -13,7 +13,7 @@ import logging
 import os
 import time
 
-from ..core import check_choice, check_range
+from ..core import Settings, check_choice, check_range
 from ..core.errors import ConnectionFailure, InstrumentTimeoutError
 
 logger = logging.getLogger(__name__)
@@ -39,11 +39,16 @@ TEMPERATURE_APPROACHES = {"fast settle": 0, "no overshoot": 1}
 FIELD_APPROACHES = {"linear": 0, "no overshoot": 1, "oscillate": 2}
 FIELD_END_STATES = {"persistent": 0, "driven": 1}
 
+# Largest field a setpoint may ask for, in oersted. The PPMS line is sold with
+# 9, 14 and 16 tesla magnets, so the default admits the largest of them and a
+# smaller magnet should be given its own figure with field_limit=.
+DEFAULT_FIELD_LIMIT = 1.6e5
+
 # Position approach modes.
 POSITION_APPROACHES = {"move to position": 0, "move to index": 1, "redefine": 2}
 
 
-class QdInstrument:
+class QdInstrument(Settings):
     """Base for Quantum Design instruments reached through MultiVu.
 
     :param instrument_type: Which instrument, e.g. 'dynacool'.
@@ -55,13 +60,24 @@ class QdInstrument:
                      module).
     """
 
+    dll_path = None
+    field_limit = None
+    instrument_type = None
+    ip_address = None
+
     def __init__(
-        self, instrument_type, ip_address="127.0.0.1", remote=True, dll_path=None
+        self,
+        instrument_type,
+        ip_address="127.0.0.1",
+        remote=True,
+        dll_path=None,
+        field_limit=DEFAULT_FIELD_LIMIT,
     ):
         code = check_choice(instrument_type, INSTRUMENT_TYPES, "instrument type")
         self.instrument_type = str(instrument_type).lower()
         self.ip_address = str(ip_address)
         self.dll_path = DEFAULT_DLL_PATH if dll_path is None else str(dll_path)
+        self.field_limit = float(field_limit)
 
         factory = self._load_assembly()
         self._instrument = factory.GetQDInstrument(code, bool(remote), self.ip_address)
@@ -126,13 +142,13 @@ class QdInstrument:
 
         :param delay: Seconds between checks.
         :param timeout: Seconds to wait before giving up.
-        :raises InstrumentTimeoutError: If it never stabilises.
+        :raises InstrumentTimeoutError: If it never stabilizes.
         """
         return self._wait(
             lambda: self.temperature_status == 1,
             delay,
             timeout,
-            "the temperature to stabilise",
+            "the temperature to stabilize",
         )
 
     # Field
@@ -155,7 +171,7 @@ class QdInstrument:
         :param approach: 'linear', 'no overshoot' or 'oscillate'.
         :param end_state: 'driven' or 'persistent'.
         """
-        check_range(field, -1e5, 1e5, "field setpoint", " Oe")
+        check_range(field, -self.field_limit, self.field_limit, "field setpoint", " Oe")
         check_range(rate, 0, 1e4, "field ramp rate", " Oe/s")
         approach_code = check_choice(approach, FIELD_APPROACHES, "field approach")
         end_code = check_choice(end_state, FIELD_END_STATES, "field end state")
@@ -166,14 +182,14 @@ class QdInstrument:
     def wait_for_field(self, delay=5.0, timeout=600.0):
         """Block until the field is stable."""
         return self._wait(
-            lambda: self.field_status == 1, delay, timeout, "the field to stabilise"
+            lambda: self.field_status == 1, delay, timeout, "the field to stabilize"
         )
 
     # Position
 
     @property
     def position(self):
-        """Returns the present sample position, in degrees or millimetres."""
+        """Returns the present sample position, in degrees or millimeters."""
         return self._instrument.GetPosition("Horizontal Rotator", 0.0, 0)[1]
 
     @property

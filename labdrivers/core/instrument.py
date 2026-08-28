@@ -9,16 +9,69 @@ That covers its command language, the ranges it accepts, and the way it
 formats a reading.
 """
 
+import difflib
 import logging
 import time
 
-from .errors import InstrumentError, InstrumentTimeoutError
+from .errors import InstrumentError, InstrumentTimeoutError, UnknownSetting
 from .transport import open_transport
+
 
 logger = logging.getLogger(__name__)
 
 
-class Instrument:
+class Settings:
+    """Refuses an attribute that is not one of this object's settings.
+
+    Python is happy to put a new attribute on any object, so a mistyped setting
+    name assigns to the object and sends nothing. The measurement then runs at
+    whatever the instrument was already on, with no error anywhere. Everything
+    else in this package says what went wrong, and this would be the one way to
+    be quietly wrong.
+
+    An instrument is not the only thing with settings on it. A magnet axis, a
+    rotation stage and a Quantum Design system all take them as well, and a name
+    misspelled on one of those goes the same way, so they carry this too.
+
+    The rule is that the class is the whole list of what an object has. A
+    setting is a property, and anything else a constructor fills in is declared
+    beside it, so writing a driver means saying once what it has rather than
+    discovering later what it turned out to have.
+    """
+
+    def __setattr__(self, name, value):
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        existing = getattr(type(self), name, None)
+        if hasattr(type(self), name) and not callable(existing):
+            object.__setattr__(self, name, value)
+            return
+
+        settings = sorted(
+            attribute
+            for attribute in dir(type(self))
+            if not attribute.startswith("_")
+            and isinstance(getattr(type(self), attribute, None), property)
+        )
+        if callable(existing):
+            # A name that exists and is a method. Assigning to it replaces the
+            # method and sends nothing, and the measurement then runs at
+            # whatever the instrument was already on. It reads naturally
+            # because the same word is a setting on a different instrument.
+            raise UnknownSetting(
+                f"'{name}' on the {type(self).__name__} is something it does, "
+                f"not something it has. Call {name}(...) instead of assigning "
+                f"to it."
+            )
+        close = difflib.get_close_matches(name, settings, n=1, cutoff=0.6)
+        suggestion = f" Did you mean '{close[0]}'?" if close else ""
+        raise UnknownSetting(
+            f"The {type(self).__name__} has no setting called '{name}'.{suggestion}"
+        )
+
+
+class Instrument(Settings):
     """Base class for an instrument reached over some transport.
 
     Every driver accepts the same connection arguments, so the choice between
@@ -173,6 +226,20 @@ class Instrument:
                 )
             time.sleep(interval)
 
+    def is_responding(self):
+        """Returns True if the instrument still answers.
+
+        Useful when a measurement has been running unattended and you want to
+        know the thing is still on the other end of the cable, which an open
+        handle does not tell you: a GPIB session survives the instrument being
+        switched off underneath it.
+
+        This base cannot ask a question without knowing the command language,
+        so it reports whether the connection is open. A driver that knows a
+        harmless question should override this and ask it.
+        """
+        return bool(self._transport.is_open)
+
     # Connection lifetime
 
     def close(self):
@@ -201,8 +268,21 @@ class ScpiInstrument(Instrument):
     ERROR_QUERY = "SYST:ERR?"
 
     def identify(self):
-        """Return the instrument's identification string (``*IDN?``)."""
+        """Returns the instrument's identification string (``*IDN?``)."""
         return self.query("*IDN?")
+
+    def is_responding(self):
+        """Returns True if the instrument answers ``*IDN?``.
+
+        Asked rather than assumed, so an instrument switched off underneath an
+        open session is reported as gone instead of as connected. Any failure
+        counts as not responding, since this is asked exactly when something is
+        suspected to be wrong.
+        """
+        try:
+            return bool(self.identify())
+        except Exception:
+            return False
 
     def verify_identity(self):
         """Check the instrument is the model this driver expects.
@@ -220,7 +300,7 @@ class ScpiInstrument(Instrument):
         return identity
 
     def reset(self):
-        """Return the instrument to its power-on defaults (``*RST``)."""
+        """Put the instrument back to its power-on defaults (``*RST``)."""
         self.write("*RST")
 
     def clear_status(self):
@@ -233,45 +313,6 @@ class ScpiInstrument(Instrument):
         :return: 0 if the instrument passed.
         """
         return self.query_integer("*TST?")
-
-    def wait_to_continue(self):
-        """Make the instrument finish pending commands before continuing
-        (``*WAI``)."""
-        self.write("*WAI")
-
-    def set_operation_complete(self):
-        """Ask the instrument to flag completion in its status byte (``*OPC``)."""
-        self.write("*OPC")
-
-    def operation_complete(self):
-        """Block until pending operations finish, then return True (``*OPC?``)."""
-        return self.query("*OPC?").strip() in ("1", "1.0")
-
-    @property
-    def event_status_register(self):
-        """Returns the standard event status register (``*ESR?``).
-
-        Reading the register clears it.
-        """
-        return self.query_integer("*ESR?")
-
-    @property
-    def event_status_enable(self):
-        """Returns the standard event status enable mask (``*ESE``)."""
-        return self.query_integer("*ESE?")
-
-    @event_status_enable.setter
-    def event_status_enable(self, mask):
-        self.write(f"*ESE {int(mask)}")
-
-    @property
-    def service_request_enable(self):
-        """Returns the service request enable mask (``*SRE``)."""
-        return self.query_integer("*SRE?")
-
-    @service_request_enable.setter
-    def service_request_enable(self, mask):
-        self.write(f"*SRE {int(mask)}")
 
     @property
     def status_byte(self):

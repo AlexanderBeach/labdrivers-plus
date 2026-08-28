@@ -18,7 +18,7 @@ from ..core import (
     check_integer_range,
     check_range,
 )
-from ..core.errors import RangeError
+from ..core.errors import InstrumentError, RangeError
 from ..core.sweep import round_trip, sweep_values
 
 # Maximum source magnitudes per model, as (current in amps, voltage in volts),
@@ -101,6 +101,9 @@ ARM_SOURCES = {
     "pstest": "PST",
     "bstest": "BST",
 }
+# Whichever of these fields are switched on, the instrument sends them in this
+# order and ignores the order they were named in, so the order here is the
+# instrument's own and both reading paths depend on it.
 DATA_ELEMENTS = {
     "voltage": "VOLT",
     "current": "CURR",
@@ -179,35 +182,36 @@ class Keithley2400(ScpiInstrument):
         """Returns the largest voltage this model can source, in volts."""
         return self._maximum_voltage
 
-    def _active_source_code(self):
-        """SCPI keyword for whichever source is currently selected."""
+    def _active_source(self):
+        """Returns the selected source as (name, keyword, limit, unit).
+
+        Every setter that writes a source level asks this first, so the
+        memory-mode check here guards all of them, and asking once means a
+        level is written with one query rather than two.
+
+        :raises RangeError: If the source is in memory mode, which has no
+                            voltage or current level to set.
+        """
         function = self.source_function
         if function == "memory":
             raise RangeError(
                 "The source is in memory mode, which has no voltage or current "
                 "level. Set source_function to 'voltage' or 'current' first."
             )
-        return SOURCE_FUNCTIONS.get(function, "VOLT")
-
-    def _source_limit(self, function=None):
-        """Largest magnitude the given source can produce on this model.
-
-        Every setter that writes a source level calls this first, so the
-        memory-mode check here guards all of them.
-
-        :raises RangeError: If the source is in memory mode, which has no
-                            voltage or current level to set.
-        """
-        function = function or self.source_function
-        if function == "memory":
-            raise RangeError(
-                "The source is in memory mode, which has no voltage or current "
-                "level. Set source_function to 'voltage' or 'current' first."
+        try:
+            code = SOURCE_FUNCTIONS[function]
+        except KeyError:
+            raise InstrumentError(
+                f"The instrument says its source function is {function!r}, which "
+                f"is not one of {', '.join(sorted(SOURCE_FUNCTIONS))}."
             )
-        return self._maximum_current if function == "current" else self._maximum_voltage
+        if function == "current":
+            return function, code, self._maximum_current, " A"
+        return function, code, self._maximum_voltage, " V"
 
-    def _source_unit(self, function):
-        return " A" if function == "current" else " V"
+    def _active_source_code(self):
+        """SCPI keyword for whichever source is currently selected."""
+        return self._active_source()[1]
 
     # Source configuration
 
@@ -246,16 +250,15 @@ class Keithley2400(ScpiInstrument):
 
     @source_value.setter
     def source_value(self, value):
-        function = self.source_function
-        limit = self._source_limit(function)
+        function, code, limit, unit = self._active_source()
         check_range(
             value,
             -limit,
             limit,
             f"{function} source level",
-            self._source_unit(function),
+            unit,
         )
-        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:LEV {value}")
+        self.write(f":SOUR:{code}:LEV {value}")
 
     @property
     def source_voltage(self):
@@ -289,16 +292,15 @@ class Keithley2400(ScpiInstrument):
 
     @source_range.setter
     def source_range(self, value):
-        function = self.source_function
-        limit = self._source_limit(function)
+        function, code, limit, unit = self._active_source()
         check_range(
             value,
             -limit,
             limit,
             f"{function} source range",
-            self._source_unit(function),
+            unit,
         )
-        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:RANG {value}")
+        self.write(f":SOUR:{code}:RANG {value}")
 
     @property
     def source_auto_range(self):
@@ -601,14 +603,13 @@ class Keithley2400(ScpiInstrument):
         """
         steps = check_integer_range(steps, 1, 100000, "number of steps")
         check_range(delay, 0, 3600, "step delay", " s")
-        function = self.source_function
-        limit = self._source_limit(function)
+        function, code, limit, unit = self._active_source()
         target = check_range(
             target,
             -limit,
             limit,
             f"{function} source level",
-            self._source_unit(function),
+            unit,
         )
 
         start = self.source_value
@@ -644,14 +645,27 @@ class Keithley2400(ScpiInstrument):
         :param elements: Which fields to return, e.g. 'voltage', 'current'.
                          Sets the data elements first. With none given, returns
                          whatever the instrument is already configured to send.
-        :return: A list of floats, one per element.
+        :return: A list of floats, one per element, in the order asked for.
         """
-        if elements:
-            self.data_elements = list(elements)
-        return self.query_floats(":READ?")
+        if not elements:
+            return self.query_floats(":READ?")
+        asked = [
+            check_choice(value, DATA_ELEMENTS, "data element") for value in elements
+        ]
+        self.data_elements = list(elements)
+        reply = self.query_floats(":READ?")
+        # Asking for current and then voltage still brings the voltage back
+        # first, because the order lives in the instrument rather than in the
+        # request. Putting the reply back into the order the caller used means
+        # read('current', 'voltage') hands back current and then voltage.
+        sent = [code for code in DATA_ELEMENTS.values() if code in asked]
+        if len(reply) != len(sent):
+            return reply
+        measured = dict(zip(sent, reply))
+        return [measured[code] for code in asked]
 
     def fetch(self):
-        """Return the last reading again, without triggering a new one."""
+        """Returns the last reading again, without triggering a new one."""
         return self.query_floats(":FETC?")
 
     def measure(self, function):
@@ -728,7 +742,7 @@ class Keithley2400(ScpiInstrument):
         self.write(f":TRAC:TST:FORM {code}")
 
     def read_buffer(self):
-        """Return everything stored in the buffer, as a list of floats."""
+        """Returns everything stored in the buffer, as a list of floats."""
         return self.query_floats(":TRAC:DATA?")
 
     def clear_buffer(self):
@@ -816,7 +830,7 @@ class Keithley2400(ScpiInstrument):
         self.write(f":ARM:TIM {value}")
 
     def clear_trigger(self):
-        """Return the trigger system to idle."""
+        """Put the trigger system back to idle."""
         self.write(":TRIG:CLE")
 
     def send_bus_trigger(self):
@@ -832,12 +846,9 @@ class Keithley2400(ScpiInstrument):
 
     @sweep_start.setter
     def sweep_start(self, value):
-        function = self.source_function
-        limit = self._source_limit(function)
-        check_range(
-            value, -limit, limit, "sweep start level", self._source_unit(function)
-        )
-        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:STAR {value}")
+        function, code, limit, unit = self._active_source()
+        check_range(value, -limit, limit, "sweep start level", unit)
+        self.write(f":SOUR:{code}:STAR {value}")
 
     @property
     def sweep_stop(self):
@@ -846,12 +857,9 @@ class Keithley2400(ScpiInstrument):
 
     @sweep_stop.setter
     def sweep_stop(self, value):
-        function = self.source_function
-        limit = self._source_limit(function)
-        check_range(
-            value, -limit, limit, "sweep stop level", self._source_unit(function)
-        )
-        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:STOP {value}")
+        function, code, limit, unit = self._active_source()
+        check_range(value, -limit, limit, "sweep stop level", unit)
+        self.write(f":SOUR:{code}:STOP {value}")
 
     @property
     def sweep_step(self):
@@ -860,12 +868,9 @@ class Keithley2400(ScpiInstrument):
 
     @sweep_step.setter
     def sweep_step(self, value):
-        function = self.source_function
-        limit = self._source_limit(function)
-        check_range(
-            value, -limit, limit, "sweep step size", self._source_unit(function)
-        )
-        self.write(f":SOUR:{SOURCE_FUNCTIONS[function]}:STEP {value}")
+        function, code, limit, unit = self._active_source()
+        check_range(value, -limit, limit, "sweep step size", unit)
+        self.write(f":SOUR:{code}:STEP {value}")
 
     @property
     def sweep_points(self):
@@ -948,7 +953,14 @@ class Keithley2400(ScpiInstrument):
             if float(step) == 0:
                 raise RangeError("The sweep step size cannot be zero.")
             self.sweep_step = step
-            points = int(abs((float(stop) - float(start)) / float(step))) + 1
+            # Counted the way the instrument counts. It walks whole steps out
+            # from the start, so it produces floor(span / step) + 1 levels and
+            # never reaches the stop value unless the step divides the span
+            # exactly. The small margin is there because 0.3 / 0.1 comes out
+            # as 2.9999999999999996, which would otherwise drop a level the
+            # sweep really does produce and park the source partway.
+            span = abs(float(stop) - float(start))
+            points = int(span / abs(float(step)) + 1e-9) + 1
         else:
             self.sweep_points = points
 
@@ -966,17 +978,11 @@ class Keithley2400(ScpiInstrument):
             raise RangeError(
                 f"A list sweep takes between 1 and 100 levels, but got {len(levels)}."
             )
-        function = self.source_function
-        limit = self._source_limit(function)
+        function, code, limit, unit = self._active_source()
         for level in levels:
-            check_range(
-                level, -limit, limit, "list sweep level", self._source_unit(function)
-            )
+            check_range(level, -limit, limit, "list sweep level", unit)
         self.source_mode = "list"
-        self.write(
-            f":SOUR:LIST:{SOURCE_FUNCTIONS[function]} "
-            + ",".join(str(level) for level in levels)
-        )
+        self.write(f":SOUR:LIST:{code} " + ",".join(str(level) for level in levels))
         self.trigger_count = len(levels)
         return len(levels)
 
@@ -1002,7 +1008,7 @@ class Keithley2400(ScpiInstrument):
         self.write(f":CALC:STAT {int(state)}")
 
     def math_data(self):
-        """Return the result of the CALC1 math expression."""
+        """Returns the result of the CALC1 math expression."""
         return self.query_floats(":CALC:DATA?")
 
     def available_math_expressions(self):
@@ -1087,6 +1093,13 @@ class Keithley2400(ScpiInstrument):
             raise RangeError(
                 f"Display text is at most 20 characters, but got {len(text)}."
             )
+        if '"' in text:
+            # The message goes to the instrument inside a quoted string, and
+            # SCPI gives no way to escape a quote within one, so a message
+            # carrying one would end early and leave the rest as commands.
+            raise RangeError(
+                f"Display text cannot contain a double quote, but got {text!r}."
+            )
         self.write(f':DISP:WIND1:TEXT:DATA "{text}"')
         self.write(":DISP:WIND1:TEXT:STAT 1")
 
@@ -1138,7 +1151,7 @@ class Keithley2400(ScpiInstrument):
         self.write(f":SYST:BEEP {frequency},{duration}")
 
     def go_to_local(self):
-        """Return the instrument to front-panel control."""
+        """Hand the instrument back to front-panel control."""
         self.write(":SYST:LOC")
 
     def go_to_remote(self):
@@ -1156,7 +1169,7 @@ class Keithley2400(ScpiInstrument):
 
     @property
     def line_frequency(self):
-        """Returns the power line frequency the instrument synchronises to."""
+        """Returns the power line frequency the instrument synchronizes to."""
         return self.query_integer(":SYST:LFR?")
 
     @line_frequency.setter
@@ -1165,7 +1178,7 @@ class Keithley2400(ScpiInstrument):
         self.write(f":SYST:LFR {code}")
 
     def preset(self):
-        """Return the instrument to its SYSTem:PRESet defaults."""
+        """Put the instrument back to its SYSTem:PRESet defaults."""
         self.write(":SYST:PRES")
 
     @property
@@ -1201,7 +1214,12 @@ class Keithley2400(ScpiInstrument):
         :param measure: What to measure, defaulting to both voltage and
                         current.
         """
-        code = check_choice(function, SOURCE_FUNCTIONS, "source function")
+        # Only the two that have a level to set. Memory mode is a source
+        # function the instrument has, and naming it here would otherwise set up
+        # a voltage source without saying so.
+        code = check_choice(
+            function, {"voltage": "VOLT", "current": "CURR"}, "source function"
+        )
         name = "current" if code == "CURR" else "voltage"
 
         self.source_function = name

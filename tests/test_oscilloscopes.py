@@ -24,6 +24,9 @@ PREAMBLE = "1,0,5,1,1e-9,0,0,1e-3,0,128"
 
 def build(responses=None, identity=IDENTITY_4CH, default=None, **kwargs):
     replies = {"*IDN?": identity}
+    # The vertical bounds move with the probe, so every channel answers with a
+    # 1:1 one unless a test says otherwise.
+    replies.update({f":CHANnel{n}:PROBe?": "1" for n in range(1, 5)})
     replies.update(responses or {})
     transport = RecordingTransport(replies, default=default)
     scope = InfiniiVision(transport=transport, **kwargs)
@@ -107,6 +110,18 @@ def test_vertical_scale_is_bounded(scope):
     instrument, _ = scope
     with pytest.raises(RangeError, match="vertical scale"):
         instrument.set_channel_scale(1, 100)
+
+
+def test_the_vertical_bound_follows_the_probe():
+    # A 10x probe moves the whole reachable range by ten, so 20 V/div is an
+    # ordinary setting on one and out of range on a 1:1 probe.
+    plain, _ = build({":CHANnel1:PROBe?": "1"})
+    with pytest.raises(RangeError, match="vertical scale"):
+        plain.set_channel_scale(1, 20)
+
+    tenfold, transport = build({":CHANnel1:PROBe?": "10"})
+    tenfold.set_channel_scale(1, 20)
+    assert transport.last_command == ":CHANnel1:SCALe 20"
 
 
 # Trigger
@@ -307,3 +322,20 @@ def test_measure_all_returns_every_quantity():
     scope, _ = build(default="1.0")
     values = scope.measure_all(1, quantities=["frequency", "peak to peak"])
     assert sorted(values) == ["frequency", "peak to peak"]
+
+
+def test_the_sign_convention_is_set_before_the_scaling_is_asked_for():
+    # The reference level the preamble reports is the one for the convention in
+    # force at the moment of the question. Asking first and switching after
+    # scales every sample against a reference the scope has already left,
+    # which puts a mid-screen trace half of full scale away from where it
+    # belongs.
+    scope, transport = build(
+        {":WAVeform:PREamble?": PREAMBLE, ":WAVeform:DATA?": [128] * 5}
+    )
+    scope.read_waveform(1, waveform_format="word")
+    sent = transport.commands
+    assert sent.index(":WAVeform:UNSigned 1") < sent.index(":WAVeform:PREamble?")
+    assert sent.index(":WAVeform:BYTeorder MSBFirst") < sent.index(
+        ":WAVeform:PREamble?"
+    )

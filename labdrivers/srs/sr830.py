@@ -159,17 +159,50 @@ class Sr830(Instrument):
                       but never answers. Pass None to leave it alone.
     """
 
-    def __init__(self, *args, interface="gpib", **kwargs):
+    #: Substring the *IDN? reply carries, used when scanning for instruments.
+    IDENTIFIER = "SR830"
+
+    def __init__(self, *args, interface="auto", **kwargs):
         super().__init__(*args, **kwargs)
+        if interface == "auto":
+            interface = self._interface_for_connection()
         if interface is not None:
             self.interface = interface
 
+    def _interface_for_connection(self):
+        """Returns the port this instrument should be told to answer on.
+
+        An SR830 replies on whichever port OUTX last named, so one reached over
+        RS-232 while OUTX still says GPIB will take every command and answer
+        into the other connector, which looks exactly like a dead instrument.
+        Rather than assume, the port is taken from how the connection was made.
+        A transport that does not say, such as the one a server holds, is left
+        alone, because whoever opened it has already chosen.
+        """
+        resource = getattr(self.transport, "resource_name", None)
+        if resource is None:
+            return None
+        return "rs232" if str(resource).upper().startswith("ASRL") else "gpib"
+
     def identify(self):
-        """Return the instrument's identification string (``*IDN?``)."""
+        """Returns the instrument's identification string (``*IDN?``)."""
         return self.query("*IDN?")
 
+    def is_responding(self):
+        """Returns True if the instrument answers ``*IDN?``.
+
+        Asked rather than assumed. An open GPIB session outlives the instrument
+        being switched off underneath it, so a check that only reports whether
+        a handle exists calls a dead instrument healthy for as long as the
+        server is left running.
+        """
+        try:
+            return bool(self.identify())
+        except Exception:
+            return False
+
     def reset(self):
-        """Return the instrument to its default settings (``*RST``)."""
+        """Put the instrument back to its default settings (``*RST``)."""
         self.write("*RST")
 
     def clear_status(self):
@@ -199,7 +232,7 @@ class Sr830(Instrument):
         self.write(f"OVRM {int(state)}")
 
     def go_to_local(self):
-        """Return the instrument to front-panel control."""
+        """Hand the instrument back to front-panel control."""
         self.write("LOCL 0")
 
     def go_to_remote(self):
@@ -350,7 +383,7 @@ class Sr830(Instrument):
     @filter_slope.setter
     def filter_slope(self, value):
         slope = check_choice(
-            int(value),
+            value,
             {s: i for i, s in enumerate(FILTER_SLOPES)},
             "low pass filter slope",
         )
@@ -426,7 +459,7 @@ class Sr830(Instrument):
         """
         index = check_choice(parameter, OFFSET_PARAMETERS, "offset parameter")
         check_range(offset, -105.0, 105.0, "offset", " percent")
-        code = check_choice(int(expand), EXPANSIONS, "expand")
+        code = check_choice(expand, EXPANSIONS, "expand")
         self.write(f"OEXP {index},{offset},{code}")
 
     def get_offset_and_expand(self, parameter):
@@ -599,10 +632,21 @@ class Sr830(Instrument):
         :return: A list of floats.
         """
         number = check_integer_range(channel, 1, 2, "display channel")
-        first = check_integer_range(start, 0, BUFFER_POINTS, "starting bin")
+        first = check_integer_range(start, 0, BUFFER_POINTS - 1, "starting bin")
         if count is None:
             count = max(self.buffer_count - first, 0)
+            if count == 0:
+                # An empty buffer is an ordinary state, not a bad argument, and
+                # saying "the number of points must be between 1 and 16383"
+                # blames the caller for a default they never chose.
+                return []
         points = check_integer_range(count, 1, BUFFER_POINTS, "number of points")
+        if first + points > BUFFER_POINTS:
+            raise RangeError(
+                f"Reading {points} points from bin {first} runs past the end "
+                f"of the buffer, which holds {BUFFER_POINTS}, but got a last "
+                f"bin of {first + points - 1}."
+            )
         return self.query_floats(f"TRCA? {number},{first},{points}")
 
     # Front panel and setups

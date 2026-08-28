@@ -48,13 +48,15 @@ class Itc503(OxfordLegacyInstrument):
     :param default_sensor: Which sensor temperature() reads when not told.
     """
 
+    default_sensor = None
+
     def __init__(self, *args, default_sensor=1, **kwargs):
         super().__init__(*args, **kwargs)
         self.default_sensor = check_integer_range(default_sensor, 1, 3, "sensor")
 
     # Readings
 
-    def temperature(self, sensor=None):
+    def temperature(self, sensor=None) -> float:
         """Read one sensor, in kelvin.
 
         :param sensor: Which sensor, 1 to 3. Defaults to default_sensor.
@@ -93,9 +95,24 @@ class Itc503(OxfordLegacyInstrument):
         check_range(value, 0, 2000, "temperature setpoint", " K")
         self.command("T", f"{float(value):.4f}")
 
+    def safe_shutdown(self):
+        """Put the heater to zero and leave the controller under manual control.
+
+        The state to leave a temperature controller in when walking away from
+        it. Automatic control is turned off first, so nothing drives the heater
+        back up after it has been set to zero.
+        """
+        self.auto_mode = "heater manual gas manual"
+        self.heater_percent = 0
+
     @property
     def heater_sensor(self):
-        """Returns which sensor the heater loop controls from, 1 to 3."""
+        """Returns the heater control sensor this object last set, 1 to 3.
+
+        The controller does not report this one back, so it is what was asked
+        for rather than what the front panel is showing, and a connection that
+        has not set it reports the default.
+        """
         return self._heater_sensor
 
     @heater_sensor.setter
@@ -108,7 +125,12 @@ class Itc503(OxfordLegacyInstrument):
 
     @property
     def auto_mode(self):
-        """Returns whether the heater and gas flow are automatic or manual."""
+        """Returns the heater and gas flow mode this object last set.
+
+        The controller does not report this one back, so it is what was asked
+        for rather than what the front panel is showing, and a connection that
+        has not set it reports the default.
+        """
         return self._auto_mode
 
     @auto_mode.setter
@@ -181,7 +203,12 @@ class Itc503(OxfordLegacyInstrument):
 
     @property
     def automatic_pid(self):
-        """Returns whether PID terms are taken from the built-in table."""
+        """Returns whether this object last asked for the built-in PID table.
+
+        The controller does not report this one back, so it is what was asked
+        for rather than what the front panel is showing, and a connection that
+        has not set it reports the default.
+        """
         return self._automatic_pid
 
     @automatic_pid.setter

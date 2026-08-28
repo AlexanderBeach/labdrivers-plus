@@ -43,10 +43,9 @@ PREAMBLE_FIELDS = (
 
 # Values the preamble reports for the transfer format and acquisition type.
 PREAMBLE_FORMATS = {0: "byte", 1: "word", 2: "ascii"}
-PREAMBLE_TYPES = {0: "normal", 1: "peak", 3: "average", 4: "high resolution"}
+PREAMBLE_TYPES = {0: "normal", 1: "peak", 2: "average", 3: "high resolution"}
 
 WAVEFORM_FORMATS = {"byte": "BYTE", "word": "WORD", "ascii": "ASCii"}
-WAVEFORM_POINTS_MODES = {"normal": "NORMal", "maximum": "MAXimum", "raw": "RAW"}
 
 COUPLINGS = {"ac": "AC", "dc": "DC"}
 IMPEDANCES = {"1m": "ONEMeg", "50": "FIFTy"}
@@ -84,6 +83,28 @@ MEASUREMENTS = {
 # The scope reports a measurement it could not make as this value rather than
 # raising, so a reading close to it means "no signal", not 9.9e37 volts.
 MEASUREMENT_FAILED = 9.9e37
+
+
+def parse_ascii_block(reply):
+    """Returns the numbers in an ASCii waveform reply.
+
+    Some models wrap even the ASCii format in the definite-length block that
+    the binary formats use, so a reply can begin #800000060 before the first
+    value. Stripping it when it is there costs nothing when it is not.
+
+    :raises InstrumentError: If the reply holds something other than numbers.
+    """
+    text = reply.strip()
+    if text.startswith("#") and len(text) > 2 and text[1].isdigit():
+        digits = int(text[1])
+        text = text[2 + digits :]
+    try:
+        return [float(piece) for piece in text.split(",") if piece.strip()]
+    except ValueError:
+        raise InstrumentError(
+            f"Expected comma-separated numbers from the waveform, but got "
+            f"{reply[:60]!r}."
+        )
 
 
 class InfiniiVision(ScpiInstrument):
@@ -180,7 +201,17 @@ class InfiniiVision(ScpiInstrument):
     def set_channel_scale(self, channel, volts_per_division):
         """Set one channel's vertical scale, in volts per division."""
         number = self._check_channel(channel)
-        check_range(volts_per_division, 1e-3, 10, "vertical scale", " V/div")
+        # The scale a channel can reach moves with what is plugged into it, so
+        # a 10x probe puts 20 V/div well inside the range while a bound fixed
+        # at the 1:1 figure turns an ordinary setting away.
+        attenuation = self.channel_probe(number)
+        check_range(
+            volts_per_division,
+            1e-3 * attenuation,
+            10 * attenuation,
+            "vertical scale",
+            " V/div",
+        )
         self.write(f":CHANnel{number}:SCALe {volts_per_division}")
 
     def channel_offset(self, channel):
@@ -469,16 +500,25 @@ class InfiniiVision(ScpiInstrument):
             count = check_integer_range(points, 1, 8000000, "waveform points")
             self.write(f":WAVeform:POINts {count}")
 
+        if waveform_format != "ascii":
+            # Parsed as unsigned, so the scope is told to send unsigned
+            # rather than trusting whatever it was last set to. A signed record
+            # read as unsigned puts every sample below mid-screen 65536 counts
+            # too high, which looks like a plausible trace at the wrong offset.
+            # This is set before the preamble is asked for, because the
+            # reference level the preamble reports is the one for the sign
+            # convention in force at the moment of the question, and scaling
+            # against the earlier one shifts the whole trace by half of scale.
+            self.write(":WAVeform:UNSigned 1")
+            if waveform_format == "word":
+                self.write(":WAVeform:BYTeorder MSBFirst")
+
         preamble = self.preamble()
 
         if waveform_format == "ascii":
-            raw = self.query_floats(":WAVeform:DATA?")
+            raw = parse_ascii_block(self.query(":WAVeform:DATA?"))
         else:
-            # WORD samples are unsigned 16-bit, most significant byte first
-            # unless told otherwise, and BYTE samples are unsigned 8-bit.
             datatype = "H" if waveform_format == "word" else "B"
-            if waveform_format == "word":
-                self.write(":WAVeform:BYTeorder MSBFirst")
             raw = self.query_binary(
                 ":WAVeform:DATA?",
                 datatype=datatype,
@@ -493,7 +533,7 @@ class InfiniiVision(ScpiInstrument):
     def scale_waveform(raw, preamble, already_scaled=False):
         """Turn raw samples and a preamble into seconds and volts.
 
-        The scope sends integers spanning its digitiser range. The preamble
+        The scope sends integers spanning its digitizer range. The preamble
         gives the increment and origin for each axis, and the reference point
         those are measured from.
 

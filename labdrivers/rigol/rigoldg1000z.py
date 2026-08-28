@@ -136,7 +136,11 @@ class RigolDG1000Z(ScpiInstrument):
         """Returns the shape being generated, e.g. 'sine' or 'square'."""
         reply = self.query(self._source("FUNC?")).strip().upper()
         for name, code in WAVEFORMS.items():
-            if reply.startswith(code.upper()[:4]):
+            # A DG1000Z answers with the short form of the mnemonic, so SIN
+            # comes back for SINusoid. The capital letters of the mnemonic are
+            # that short form, which is how SCPI writes them.
+            short = "".join(letter for letter in code if letter.isupper())
+            if reply == short or reply.startswith(short):
                 return name
         return reply.lower()
 
@@ -164,13 +168,19 @@ class RigolDG1000Z(ScpiInstrument):
 
     @amplitude.setter
     def amplitude(self, value):
-        smallest, largest = self._amplitude_limits()
-        check_range(value, smallest, largest, "amplitude", " Vpp")
+        # These limits are peak-to-peak volts. The same numbers are not the
+        # right bounds in volts rms or in dBm, where the conversion depends on
+        # the load and on the shape being generated, and applying them anyway
+        # would refuse ordinary levels. In those units the generator judges its
+        # own range.
+        if self.voltage_unit == "vpp":
+            smallest, largest = self._amplitude_limits()
+            check_range(value, smallest, largest, "amplitude", " Vpp")
         self.write(self._source(f"VOLT {value}"))
 
     @property
     def offset(self):
-        """Returns the dC offset, in volts."""
+        """Returns the DC offset, in volts."""
         return self.query_float(self._source("VOLT:OFFS?"))
 
     @offset.setter

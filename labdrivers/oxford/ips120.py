@@ -35,7 +35,7 @@ PARAMETERS = {
 }
 
 ACTIVITIES = {"hold": 0, "to setpoint": 1, "to zero": 2, "clamp": 4}
-HEATER_STATES = {"off": 0, "on": 1, "off forced": 2}
+HEATER_STATES = {"off": 0, "on": 1, "on forced": 2}
 DEFAULT_FIELD_LIMIT = 8.0
 
 
@@ -48,6 +48,8 @@ class Ips120(OxfordLegacyInstrument):
 
     :param field_limit: Largest field this magnet may be asked for, in tesla.
     """
+
+    field_limit = None
 
     def __init__(self, *args, field_limit=DEFAULT_FIELD_LIMIT, **kwargs):
         super().__init__(*args, **kwargs)
@@ -113,8 +115,7 @@ class Ips120(OxfordLegacyInstrument):
 
         One of 'hold', 'to setpoint', 'to zero' or 'clamp'.
         """
-        status = self.status()
-        code = int(status[4]) if len(status) > 4 else 0
+        code = self._status_digit("A")
         for name, value in ACTIVITIES.items():
             if value == code:
                 return name
@@ -127,30 +128,44 @@ class Ips120(OxfordLegacyInstrument):
 
     @property
     def switch_heater(self):
-        """Returns whether the persistent-mode switch heater is on."""
-        status = self.status()
-        return len(status) > 8 and status[8] == "1"
+        """Returns whether the persistent-mode switch heater is on.
+
+        The status digit is not the H command's code. The controller reports 0
+        for off with the magnet at zero, 1 for on, and 2 for off with the magnet
+        left at field, so only 1 means the switch is open.
+        """
+        return self._status_digit("H") == 1
 
     @switch_heater.setter
     def switch_heater(self, value):
-        if isinstance(value, str) and value.strip().lower() == "off forced":
-            self.command("H", HEATER_STATES["off forced"])
+        if isinstance(value, str) and value.strip().lower() == "on forced":
+            # Code 2 opens the switch without first checking that the supply
+            # output matches the current already circulating in the magnet.
+            # Opening it across a mismatch drives the difference through the
+            # switch and can quench the magnet, so it is reachable only by
+            # asking for it in words.
+            self.command("H", HEATER_STATES["on forced"])
             return
         state = check_boolean(value, "switch heater")
         self.command("H", HEATER_STATES["on" if state else "off"])
 
     def status(self):
-        """Return the raw status string (``X``).
+        """Returns the raw status string (``X``).
 
         The reply is a fixed-width field of digits describing system status,
-        activity, heater state and sweep mode.
+        activity, heater state and sweep mode, as XmnAnCnHnMmnPmn.
         """
-        return self.query("X").strip()
+        return self.command("X")
+
+    def _status_digit(self, letter):
+        """Returns the digit the status string carries after one of its letters."""
+        status = self.status()
+        return int(status[status.index(letter) + 1])
 
     def set_display(self, quantity="tesla"):
-        """Choose whether the front panel shows amps or tesla (``F<n>``)."""
+        """Choose whether the front panel shows amps or tesla (``M<n>``)."""
         code = check_choice(quantity, {"amps": 8, "tesla": 9}, "display quantity")
-        self.command("F", code)
+        self.command("M", code)
 
     # Ramping
 
@@ -165,6 +180,17 @@ class Ips120(OxfordLegacyInstrument):
     def ramp_to_zero(self):
         """Sweep the field down to zero."""
         self.activity = "to zero"
+
+    def safe_shutdown(self, timeout=3600.0):
+        """Ramp the field to zero and leave the supply holding.
+
+        The state to leave a magnet in when walking away from it. The switch
+        heater is left as it is, because turning it off traps whatever field
+        the coil is at and this is meant to end with none.
+        """
+        self.ramp_to_zero()
+        self.wait_for_field(0.0, timeout=timeout)
+        self.hold()
 
     def clamp(self):
         """Clamp the output."""

@@ -6,7 +6,7 @@ temperature sensor. It is most often paired with a 6221 current source over the
 trigger link, where the 6221 drives the current and the 2182 reads the voltage.
 
 Commands and ranges are transcribed from the *Model 2182/2182A Nanovoltmeter
-User's Manual*, Tables 2-3, 3-3 and the SCPI reference in Appendix.
+User's Manual*, Tables 2-3, 3-3 and the SCPI reference in the appendix.
 """
 
 import math
@@ -61,6 +61,8 @@ class Keithley2182(ScpiInstrument):
     """
 
     IDENTIFIER = "2182"
+
+    line_frequency = None
 
     def __init__(self, *args, line_frequency=60, **kwargs):
         super().__init__(*args, **kwargs)
@@ -313,17 +315,18 @@ class Keithley2182(ScpiInstrument):
         return self.query_float(":READ?")
 
     def fetch(self):
-        """Return the last reading again, without triggering a new one."""
+        """Returns the last reading again, without triggering a new one."""
         return self.query_float(":FETC?")
 
     def latest(self):
-        """Return the most recent reading, whenever it was taken."""
+        """Returns the most recent reading, whenever it was taken."""
         return self.query_float(":SENS:DATA:LAT?")
 
     def fresh(self):
-        """Block until a reading that has not been returned before is available.
+        """Returns the first reading taken after this call.
 
-        Distinct from latest(), which will hand back the same reading twice.
+        Blocks until one is available, which is what separates it from
+        latest(), since that will hand back the same reading twice.
         """
         return self.query_float(":SENS:DATA:FRES?")
 
@@ -429,7 +432,7 @@ class Keithley2182(ScpiInstrument):
         self.write(f":TRAC:POIN {points}")
 
     def read_buffer(self):
-        """Return everything stored in the buffer, as a list of floats."""
+        """Returns everything stored in the buffer, as a list of floats."""
         return self.query_floats(":TRAC:DATA?")
 
     def clear_buffer(self):
@@ -476,17 +479,17 @@ class Keithley2182(ScpiInstrument):
         self.write(f":SYST:FAZ:STAT {int(state)}")
 
     @property
-    def line_synchronisation(self):
-        """Returns whether readings are synchronised to the power line."""
+    def line_synchronization(self):
+        """Returns whether readings are synchronized to the power line."""
         return self.query_boolean(":SYST:LSYN:STAT?")
 
-    @line_synchronisation.setter
-    def line_synchronisation(self, value):
-        state = check_boolean(value, "line synchronisation")
+    @line_synchronization.setter
+    def line_synchronization(self, value):
+        state = check_boolean(value, "line synchronization")
         self.write(f":SYST:LSYN:STAT {int(state)}")
 
     def preset(self):
-        """Return the instrument to its SYSTem:PRESet defaults."""
+        """Put the instrument back to its SYSTem:PRESet defaults."""
         self.write(":SYST:PRES")
 
     @property
@@ -519,7 +522,7 @@ class Keithley2182(ScpiInstrument):
         self.write(":DISP:TEXT:STAT 0")
 
     def go_to_local(self):
-        """Return the instrument to front-panel control."""
+        """Hand the instrument back to front-panel control."""
         self.write(":SYST:LOC")
 
     def go_to_remote(self):

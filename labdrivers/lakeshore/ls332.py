@@ -17,7 +17,7 @@ from ..core import (
     check_integer_range,
     check_range,
 )
-from ..core.errors import InstrumentTimeoutError
+from ..core.errors import InstrumentError, InstrumentTimeoutError
 from ..core.sweep import sweep_values
 
 INPUTS = ("A", "B")
@@ -49,6 +49,12 @@ SENSOR_TYPES = {
 }
 
 
+# Front-panel brightness, as the percentages the manual names and the codes the
+# instrument takes for them.
+BRIGHTNESS_CODES = {25: 0, 50: 1, 75: 2, 100: 3}
+BRIGHTNESS_PERCENT = {code: percent for percent, code in BRIGHTNESS_CODES.items()}
+
+
 class Ls332(Instrument):
     """Interface to a Lake Shore 332 temperature controller.
 
@@ -61,17 +67,30 @@ class Ls332(Instrument):
     IDENTIFIER = "MODEL332"
 
     def _check_input(self, channel):
-        return check_choice(channel, {name: name for name in INPUTS}, "sensor input")
+        return check_choice(channel, INPUTS, "sensor input")
 
     def _check_loop(self, loop):
         return check_integer_range(loop, LOOPS[0], LOOPS[-1], "control loop")
 
     def identify(self):
-        """Return the instrument's identification string (``*IDN?``)."""
+        """Returns the instrument's identification string (``*IDN?``)."""
         return self.query("*IDN?")
 
+    def is_responding(self):
+        """Returns True if the instrument answers ``*IDN?``.
+
+        Asked rather than assumed. An open GPIB session outlives the instrument
+        being switched off underneath it, so a check that only reports whether
+        a handle exists calls a dead instrument healthy for as long as the
+        server is left running.
+        """
+        try:
+            return bool(self.identify())
+        except Exception:
+            return False
+
     def reset(self):
-        """Return the instrument to its power-on defaults (``*RST``)."""
+        """Put the instrument back to its power-on defaults (``*RST``)."""
         self.write("*RST")
 
     def clear_status(self):
@@ -80,11 +99,11 @@ class Ls332(Instrument):
 
     # Readings
 
-    def temperature(self, channel="A"):
+    def temperature(self, channel="A") -> float:
         """Read one sensor input, in kelvin."""
         return self.query_float(f"KRDG? {self._check_input(channel)}")
 
-    def temperature_celsius(self, channel="A"):
+    def temperature_celsius(self, channel="A") -> float:
         """Read one sensor input, in degrees Celsius."""
         return self.query_float(f"CRDG? {self._check_input(channel)}")
 
@@ -198,8 +217,20 @@ class Ls332(Instrument):
     ):
         """Point a control loop at a sensor and choose its setpoint units.
 
+        The last two values go out as the fourth and fifth fields of CSET.
+        Lake Shore assign those two fields differently across the 331, 332 and
+        340, and on a controller where the fourth is the loop's own enable, a
+        call made with the defaults switches the loop off rather than setting
+        it up. Check the front panel still shows the loop enabled the first
+        time this is used on a given controller.
+
+        :param loop: Which control loop, 1 or 2.
+        :param channel: Which input the loop reads to control from.
+        :param units: Units the setpoint is given in.
         :param powerup_enable: Whether the loop re-enables itself after a
                                power cycle.
+        :param heater_on_error: Whether the heater stays on when the loop
+                                reports an error.
         """
         number = self._check_loop(loop)
         letter = self._check_input(channel)
@@ -284,14 +315,22 @@ class Ls332(Instrument):
     @property
     def display_brightness(self):
         """Returns the front-panel brightness, as a percentage."""
-        return self.query_integer("BRIGT?")
+        return BRIGHTNESS_PERCENT[self.query_integer("BRIGT?")]
 
     @display_brightness.setter
     def display_brightness(self, value):
-        code = check_choice(
-            int(value), {25: 0, 50: 1, 75: 2, 100: 3}, "display brightness"
-        )
+        code = check_choice(value, BRIGHTNESS_CODES, "display brightness")
         self.write(f"BRIGT {code}")
+
+    def safe_shutdown(self):
+        """Turn the heater off and leave the controller reading.
+
+        The state to leave a temperature controller in when walking away from
+        it. The setpoint is left alone, since it is a number rather than a
+        thing delivering power, and the range is what actually drives current
+        into the heater.
+        """
+        self.heater_range = "off"
 
     def lock_front_panel(self, locked=True, code=123):
         """Lock or unlock the front panel keypad.
@@ -303,7 +342,7 @@ class Ls332(Instrument):
         self.write(f"LOCK {int(state)},{number:03d}")
 
     def go_to_local(self):
-        """Return the instrument to front-panel control."""
+        """Hand the instrument back to front-panel control."""
         self.write("MODE 0")
 
     def go_to_remote(self):
@@ -332,6 +371,15 @@ class Ls332(Instrument):
         :param tolerance: How close counts as settled, as a fraction of target.
         :param hold: Seconds it must stay within tolerance.
         """
+        if self.heater_range == "off":
+            # Asked before the wait rather than discovered at the end of it.
+            # Nothing else in the loop can tell the difference between a heater
+            # that is off and a cryostat that is simply slow, so without this
+            # the answer arrives when the timeout does.
+            raise InstrumentError(
+                "The heater range is off, so the loop cannot reach a setpoint. "
+                "Set heater_range to 'low', 'medium' or 'high' first."
+            )
         if target is None:
             target = self.setpoint(1)
         target = float(target)
@@ -389,7 +437,23 @@ class Ls332(Instrument):
     ):
         """Step through a series of temperatures, yielding once each is stable.
 
+            for temperature in controller.sweep_temperature(2, 10, points=9):
+                resistance = measure()
+
+        :param start: First temperature, in kelvin.
+        :param stop: Last temperature, in kelvin.
+        :param points: Number of temperatures, including both ends.
+        :param step: Spacing between temperatures, as an alternative to points.
         :param rate: Ramp rate in kelvin per minute, applied once at the start.
+        :param channel: Which input to watch while waiting.
+        :param tolerance: How close counts as settled, as a fraction of the
+                          target rather than an absolute number of kelvin. The
+                          default of 0.05 is a window of 0.075 K at 1.5 K and
+                          15 K at 300 K, so a sweep crossing a wide span wants
+                          a smaller number than one at the bottom of it.
+        :param hold: Seconds the temperature must stay inside that window
+                     before the point counts as reached.
+        :param timeout: Seconds to wait at any one temperature before giving up.
         :yield: The temperature actually reached, in kelvin.
         """
         if rate is not None:

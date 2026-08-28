@@ -30,10 +30,17 @@ class RangeError(LabdriversError, ValueError):
     """
 
 
-class TimeoutError_(LabdriversError):
-    """Raised when an instrument does not respond, or a wait never settles."""
+class InstrumentTimeoutError(LabdriversError, TimeoutError):
+    """Raised when an instrument does not respond, or a wait never settles.
+
+    Also derives from the builtin :class:`TimeoutError`, since that is what a
+    caller waiting on something slow would naturally expect to catch.
+    """
 
 
-# Exported under a friendlier name. The trailing underscore above only avoids
-# shadowing the builtin inside this module.
-InstrumentTimeoutError = TimeoutError_
+class UnknownSetting(LabdriversError, AttributeError):
+    """Raised when a name is not a setting the instrument has.
+
+    Also derives from :class:`AttributeError`, since assigning to a name an
+    object does not have is what that one has always meant.
+    """

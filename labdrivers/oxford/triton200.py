@@ -47,6 +47,11 @@ class Triton200(MercuryInstrument):
                               Must be one shorter than heater_ranges.
     """
 
+    heater_channel = None
+    heater_ranges = None
+    heater_thresholds = None
+    turbo_channel = None
+
     def __init__(
         self,
         *args,
@@ -86,7 +91,7 @@ class Triton200(MercuryInstrument):
 
     # Temperature
 
-    def temperature(self, channel=None):
+    def temperature(self, channel=None) -> float:
         """Read one temperature channel, in kelvin.
 
         :param channel: Which channel. Defaults to the control channel.
@@ -96,7 +101,7 @@ class Triton200(MercuryInstrument):
         )
         return self.read_value(f"DEV:T{number}:TEMP:SIG:TEMP", "K")
 
-    def resistance(self, channel=None):
+    def resistance(self, channel=None) -> float:
         """Read one channel's raw sensor resistance, in ohms."""
         number = self._check_channel(
             self._temperature_channel if channel is None else channel
@@ -171,6 +176,15 @@ class Triton200(MercuryInstrument):
     def heater_power(self):
         """Returns the power the mixing chamber heater is delivering, in watts."""
         return self.read_value(f"DEV:H{self.heater_channel}:HTR:SIG:POWR", "W")
+
+    def safe_shutdown(self):
+        """Open the control loop so the heater stops being driven.
+
+        The state to leave a fridge in when walking away from it. The setpoint
+        is left as it is, since it is a number rather than a thing delivering
+        power, and an open loop is what stops the mixing chamber heater.
+        """
+        self.open_loop()
 
     # Control loop
 
@@ -326,6 +340,14 @@ class Triton200(MercuryInstrument):
         :param stop: Last temperature, in kelvin.
         :param points: Number of temperatures, including both ends.
         :param step: Spacing between temperatures, as an alternative to points.
+        :param tolerance: How close counts as settled, as a fraction of the
+                          target rather than an absolute number of kelvin. The
+                          default of 0.05 is a window of 0.075 K at 1.5 K and
+                          15 K at 300 K, so a sweep crossing a wide span wants
+                          a smaller number than one at the bottom of it.
+        :param hold: Seconds the temperature must stay inside that window
+                     before the point counts as reached.
+        :param timeout: Seconds to wait at any one temperature before giving up.
         :yield: The temperature actually reached, in kelvin.
         """
         for target in sweep_values(start, stop, points=points, step=step):

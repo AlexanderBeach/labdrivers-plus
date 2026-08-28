@@ -41,6 +41,49 @@ def test_output_interface_is_set_at_construction():
     assert transport.writes == ["OUTX 0"]
 
 
+def test_the_output_port_follows_the_connection():
+    """A lock-in reached over RS-232 while OUTX still says GPIB takes every
+    command and answers into the other connector, which looks exactly like a
+    dead instrument. The default follows how the connection was made."""
+
+    class Wired(RecordingTransport):
+        def __init__(self, resource_name, **kwargs):
+            super().__init__(**kwargs)
+            self.resource_name = resource_name
+
+    serial = Wired("ASRL3::INSTR", default="0")
+    Sr830(transport=serial)
+    assert serial.writes == ["OUTX 0"]
+
+    for resource in (
+        "GPIB0::8::INSTR",
+        "TCPIP0::192.168.0.20::INSTR",
+        "USB0::0xB506::0x2000::1::INSTR",
+    ):
+        wire = Wired(resource, default="0")
+        Sr830(transport=wire)
+        assert wire.writes == ["OUTX 1"], resource
+
+
+def test_an_explicit_interface_beats_the_connection():
+    class Wired(RecordingTransport):
+        def __init__(self, resource_name, **kwargs):
+            super().__init__(**kwargs)
+            self.resource_name = resource_name
+
+    wire = Wired("ASRL3::INSTR", default="0")
+    Sr830(transport=wire, interface="gpib")
+    assert wire.writes == ["OUTX 1"]
+
+
+def test_a_connection_that_does_not_say_is_left_alone():
+    # A server holds the real connection and has already chosen the port, so
+    # a client must not overwrite it from the other end.
+    transport = RecordingTransport(default="0")
+    Sr830(transport=transport)
+    assert transport.writes == []
+
+
 def test_interface_can_be_left_alone():
     transport = RecordingTransport()
     Sr830(transport=transport, interface=None)

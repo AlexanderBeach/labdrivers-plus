@@ -6,3 +6,6 @@ dist/
 .venv/
 venv/
 
+
+# Data written by the examples in the README.
+*.csv

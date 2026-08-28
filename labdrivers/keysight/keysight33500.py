@@ -207,13 +207,19 @@ class Keysight33500(ScpiInstrument):
 
     @amplitude.setter
     def amplitude(self, value):
-        smallest, largest = self._amplitude_limits()
-        check_range(value, smallest, largest, "amplitude", " Vpp")
+        # These limits are peak-to-peak volts. The same numbers are not the
+        # right bounds in volts rms or in dBm, where the conversion depends on
+        # the load and on the shape being generated, and applying them anyway
+        # would refuse ordinary levels. In those units the generator judges its
+        # own range.
+        if self.voltage_unit == "vpp":
+            smallest, largest = self._amplitude_limits()
+            check_range(value, smallest, largest, "amplitude", " Vpp")
         self.write(self._source(f"VOLT {value}"))
 
     @property
     def offset(self):
-        """Returns the dC offset, in volts."""
+        """Returns the DC offset, in volts."""
         return self.query_float(self._source("VOLT:OFFS?"))
 
     @offset.setter
@@ -264,7 +270,7 @@ class Keysight33500(ScpiInstrument):
         check_range(value, -360, 360, "phase", " degrees")
         self.write(self._source(f"PHAS {value}"))
 
-    def synchronise_phase(self):
+    def synchronize_phase(self):
         """Align the phase of both channels."""
         self.write(self._source("PHAS:SYNC"))
 

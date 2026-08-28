@@ -33,7 +33,7 @@ def test_frequency_commands(vna):
     assert transport.last_command == ":SENS1:FREQ:STOP 2000000000.0"
 
 
-def test_frequency_outside_the_analyser_range_is_rejected(vna):
+def test_frequency_outside_the_analyzer_range_is_rejected(vna):
     instrument, _ = vna
     with pytest.raises(RangeError, match="start frequency"):
         instrument.start_frequency = 1e12
@@ -114,7 +114,7 @@ def test_configure_sweep_sets_everything(vna):
     ]
 
 
-def test_configure_sweep_by_centre_and_span(vna):
+def test_configure_sweep_by_center_and_span(vna):
     instrument, transport = vna
     instrument.configure_sweep(center=1.5e9, span=1e9)
     assert ":SENS1:FREQ:CENT 1500000000.0" in transport.writes
@@ -276,7 +276,7 @@ def test_set_marker(vna):
     ]
 
 
-def test_marker_frequency_is_checked_against_the_analyser_range(vna):
+def test_marker_frequency_is_checked_against_the_analyzer_range(vna):
     instrument, _ = vna
     with pytest.raises(RangeError, match="marker frequency"):
         instrument.set_marker(1, 1e12)

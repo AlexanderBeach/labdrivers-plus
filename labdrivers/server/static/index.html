@@ -1,0 +1,1061 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>labdrivers</title>
+<style>
+/* An instrument rack, seen head on.
+   Warm chassis neutrals against a cool readout, which is what a bench looks
+   like: putty-gray panels, cyan display. Semantic color stays out of the
+   accent so that good, warning and fault read as themselves.
+
+   No web fonts. This page is served by a machine on a lab network that may
+   have no route to the internet, and a silent fallback at the bench is worse
+   than a system stack chosen on purpose. Monospace does both jobs here,
+   small and letterspaced for the silkscreen labels, large and tabular for
+   the readouts, which is how a real front panel is laid out. */
+
+:root {
+  --paper:   #eceae4;
+  --panel:   #f7f6f2;
+  --recess:  #e3e0d8;
+  --line:    #d5d1c7;
+  --edge:    #ffffff;
+  --ink:     #23211c;
+  --dim:     #6b665c;
+  --faint:   #6f6a5f;
+  --readout: #0d6d84;
+  --good:    #2f7d32;
+  --warn:    #8a5a0c;
+  --bad:     #a8322a;
+
+  color-scheme: light;
+
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Segoe UI Mono",
+          Consolas, "DejaVu Sans Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --unit: 4px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper:   #131210;
+    --panel:   #1e1c17;
+    --recess:  #17150f;
+    --line:    #35312a;
+    --edge:    #2b2820;
+    --ink:     #ebe7dd;
+    --dim:     #968f81;
+    --faint:   #99927f;
+    --readout: #58c6de;
+    --good:    #63b463;
+    --warn:    #d3a244;
+    --bad:     #e0705f;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --paper:   #131210;
+  --panel:   #1e1c17;
+  --recess:  #17150f;
+  --line:    #35312a;
+  --edge:    #2b2820;
+  --ink:     #ebe7dd;
+  --dim:     #968f81;
+  --faint:   #99927f;
+  --readout: #58c6de;
+  --good:    #63b463;
+  --warn:    #d3a244;
+  --bad:     #e0705f;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 14px/1.5 var(--sans);
+}
+
+:focus-visible { outline: 2px solid var(--readout); outline-offset: 1px; }
+
+/* The rail. What is up, before any panel is read. */
+
+header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: calc(var(--unit) * 3);
+  padding: calc(var(--unit) * 3) calc(var(--unit) * 5);
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5;
+}
+
+h1 {
+  margin: 0; font: 600 13px var(--mono);
+  letter-spacing: .18em; text-transform: uppercase;
+}
+
+.host { font: 12px var(--mono); color: var(--faint); }
+
+.tally {
+  display: flex; gap: calc(var(--unit) * 4); margin-left: auto;
+  font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase;
+}
+.tally span { color: var(--dim); }
+.tally b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.tally .up b   { color: var(--good); }
+.tally .down b { color: var(--bad); }
+
+/* The rack. */
+
+main {
+  padding: calc(var(--unit) * 5);
+  display: grid; gap: calc(var(--unit) * 4);
+  grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr));
+  align-items: start;
+}
+
+.unit {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-top-color: var(--edge);
+  border-radius: 3px;
+}
+
+.bezel {
+  display: flex; align-items: baseline; gap: calc(var(--unit) * 2);
+  padding: calc(var(--unit) * 3) calc(var(--unit) * 3.5);
+  border-bottom: 1px solid var(--line);
+}
+
+.bezel .name {
+  font: 600 13px var(--mono); letter-spacing: .06em;
+}
+
+.bezel .wiring {
+  font: 11px var(--mono); color: var(--faint); margin-right: auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Status is a lamp as well as a word, so a rack of panels reads at a glance. */
+
+.lamp {
+  display: flex; align-items: center; gap: calc(var(--unit) * 1.5);
+  flex-shrink: 0;
+  font: 10px var(--mono); letter-spacing: .12em; text-transform: uppercase;
+  color: var(--dim);
+}
+.lamp::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--faint);
+}
+.lamp.connected::before { background: var(--good); }
+.lamp.connected { color: var(--good); }
+.lamp.error::before, .lamp.disconnected::before { background: var(--bad); }
+.lamp.error, .lamp.disconnected { color: var(--bad); }
+
+/* How old the numbers are. A panel that has not been re-read since midnight is
+   the dangerous kind of wrong, because it looks exactly like a fresh one. */
+.age {
+  font: 10px var(--mono); letter-spacing: .1em; color: var(--faint);
+  flex-shrink: 0;
+}
+.age.stale { color: var(--warn); }
+.age.old { color: var(--bad); }
+
+/* Which machines have used this instrument lately, so somebody about to take
+   a magnet over can see they would not be alone. */
+.users {
+  padding: calc(var(--unit) * 1.5) calc(var(--unit) * 3.5);
+  border-top: 1px solid var(--line);
+  font: 10px var(--mono); letter-spacing: .08em; color: var(--dim);
+}
+.users b { color: var(--readout); font-weight: 600; }
+.users:empty { display: none; }
+
+/* Readouts. Label small and quiet, value large and aligned. */
+
+.readouts { padding: calc(var(--unit) * 1.5) 0; max-height: 440px;
+            overflow-y: auto; }
+
+.line {
+  display: grid; grid-template-columns: 1fr auto;
+  align-items: center; gap: calc(var(--unit) * 2);
+  padding: calc(var(--unit) * 1) calc(var(--unit) * 3.5);
+}
+.line:hover { background: var(--recess); }
+
+.line .label {
+  font: 10px var(--mono); letter-spacing: .1em; text-transform: uppercase;
+  color: var(--dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.line .right { display: flex; align-items: baseline;
+               gap: calc(var(--unit) * 1.5); }
+
+/* Capped, because not every property answers with a number. A driver that
+   hands back a sub-device or a long identity string would otherwise push the
+   whole column out of shape. The full text stays in the title. */
+.line .value {
+  font: 15px var(--mono); font-variant-numeric: tabular-nums;
+  color: var(--ink); text-align: right;
+  min-width: 90px; max-width: 190px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.line .value.faulted { color: var(--bad); font-size: 11px; }
+
+.line .unit-label {
+  font: 10px var(--mono); color: var(--faint);
+  min-width: 26px; text-align: left;
+}
+
+input, select {
+  font: 13px var(--mono); color: var(--ink);
+  background: var(--recess);
+  border: 1px solid var(--line); border-radius: 2px;
+  padding: calc(var(--unit) * .5) calc(var(--unit) * 1.5);
+}
+.line input { width: 84px; text-align: right; }
+input::placeholder { color: var(--faint); }
+
+/* Controls. What is interactive looks interactive. */
+
+.controls {
+  display: flex; flex-wrap: wrap; gap: var(--unit);
+  padding: calc(var(--unit) * 2.5) calc(var(--unit) * 3.5);
+  border-top: 1px solid var(--line);
+}
+
+button {
+  font: 11px var(--mono); letter-spacing: .08em; text-transform: uppercase;
+  padding: calc(var(--unit) * 1.25) calc(var(--unit) * 2.5);
+  color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 2px; cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--readout); color: var(--readout); }
+button:disabled, input:disabled {
+  opacity: .45; cursor: not-allowed;
+}
+button:active { background: var(--recess); }
+button.primary {
+  background: var(--readout); border-color: var(--readout);
+  color: var(--panel);
+}
+button.primary:hover { filter: brightness(1.1); color: var(--panel); }
+button.strip { padding: calc(var(--unit) * .75) calc(var(--unit) * 1.5); }
+
+/* The instrument's own keys, kept apart from the panel's own controls. A
+   sourcemeter has twenty-five of them and the panel has three, and mixing the
+   two makes it hard to find Reconnect when something has gone wrong. */
+
+.keys {
+  display: flex; flex-wrap: wrap; gap: var(--unit);
+  padding: calc(var(--unit) * 2) calc(var(--unit) * 3.5);
+  border-top: 1px solid var(--line);
+  background: var(--recess);
+}
+
+/* Drawers. Shut, a panel is a status board. Open, it is a control surface. */
+
+details { border-top: 1px solid var(--line); }
+summary {
+  padding: calc(var(--unit) * 1.75) calc(var(--unit) * 3.5);
+  font: 10px var(--mono); letter-spacing: .12em; text-transform: uppercase;
+  color: var(--faint); cursor: pointer; list-style: none;
+}
+summary::-webkit-details-marker { display: none; }
+/* Drawn rather than typed. The triangle characters are missing from the
+   monospace faces this page falls back to, and render as empty boxes. */
+summary::before {
+  content: ""; display: inline-block; vertical-align: middle;
+  margin-right: calc(var(--unit) * 2);
+  border: 4px solid transparent; border-left-color: currentColor;
+  transform-origin: 2px 50%; transition: transform .12s ease;
+}
+details[open] > summary::before { transform: rotate(90deg); }
+@media (prefers-reduced-motion: reduce) {
+  summary::before { transition: none; }
+}
+summary:hover { color: var(--readout); }
+summary b { font-weight: 600; color: var(--dim); }
+details .readouts { border-top: 1px solid var(--line); max-height: 300px; }
+details .console { border-top: 1px solid var(--line); }
+
+/* A fault reads as a fault, and says what the instrument said. */
+
+.fault {
+  padding: calc(var(--unit) * 2) calc(var(--unit) * 3.5);
+  border-top: 1px solid var(--line);
+  border-left: 3px solid var(--bad);
+  background: var(--recess);
+  font: 12px/1.45 var(--sans); color: var(--ink);
+  white-space: pre-wrap;
+}
+
+/* The console strip, recessed like a panel cutout. */
+
+.console {
+  display: flex; gap: var(--unit);
+  padding: calc(var(--unit) * 2) calc(var(--unit) * 3.5);
+  border-top: 1px solid var(--line);
+  background: var(--recess);
+}
+.console input { flex: 1; }
+.echo {
+  padding: 0 calc(var(--unit) * 3.5) calc(var(--unit) * 2);
+  background: var(--recess);
+  font: 11px var(--mono); color: var(--dim); word-break: break-all;
+}
+.echo:empty { display: none; }
+
+/* A phone during a cooldown is a stated use, so the readout gives up its
+   minimum width before the page gives up its edges. */
+@media (max-width: 520px) {
+  main { padding: calc(var(--unit) * 2); }
+  .line .value { min-width: 0; }
+  .line, .bezel, .controls, .console, summary, .fault {
+    padding-left: calc(var(--unit) * 2.5);
+    padding-right: calc(var(--unit) * 2.5);
+  }
+  .bezel { flex-wrap: wrap; }
+  .bezel .wiring { flex-basis: 100%; }
+}
+
+.empty {
+  grid-column: 1 / -1; padding: calc(var(--unit) * 16);
+  text-align: center; color: var(--faint);
+  font: 12px var(--mono); letter-spacing: .1em; text-transform: uppercase;
+}
+
+/* Adding and describing. */
+
+dialog {
+  padding: 0; width: min(720px, 94vw);
+  background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 3px;
+}
+dialog::backdrop { background: rgb(0 0 0 / .45); }
+dialog h3 {
+  margin: 0; padding: calc(var(--unit) * 3) calc(var(--unit) * 4);
+  border-bottom: 1px solid var(--line);
+  font: 600 12px var(--mono); letter-spacing: .12em; text-transform: uppercase;
+}
+dialog .body { padding: calc(var(--unit) * 4); }
+dialog .controls { justify-content: flex-end; }
+
+label {
+  display: block; margin: calc(var(--unit) * 3) 0 var(--unit);
+  font: 10px var(--mono); letter-spacing: .12em; text-transform: uppercase;
+  color: var(--dim);
+}
+.wide { width: 100%; }
+.hint { text-transform: none; letter-spacing: 0; color: var(--faint);
+        font: 11px var(--sans); }
+
+table { width: 100%; border-collapse: collapse; }
+th {
+  text-align: left; padding: var(--unit) calc(var(--unit) * 1.5);
+  border-bottom: 1px solid var(--line);
+  font: 10px var(--mono); letter-spacing: .1em; text-transform: uppercase;
+  color: var(--dim); font-weight: 400;
+}
+td { padding: var(--unit) calc(var(--unit) * .75);
+     border-bottom: 1px solid var(--line); font: 12px var(--mono); }
+td.choice { font-family: var(--sans); }
+#rows input, #rows select { width: 100%; font-size: 12px; }
+
+.found { margin-top: calc(var(--unit) * 3); overflow-x: auto; }
+.problem { color: var(--bad); font: 12px var(--sans); margin-right: auto; }
+.working { color: var(--faint); font: 11px var(--mono); letter-spacing: .1em;
+           text-transform: uppercase; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>labdrivers</h1>
+  <span class="host" id="host"></span>
+  <div class="tally" id="tally"></div>
+  <button onclick="cycleTheme()" id="theme" title="Follow the system, or force one">auto</button>
+  <button onclick="readAll()">Read all</button>
+  <button class="primary" onclick="openAdd()">Add instrument</button>
+</header>
+
+<main id="rack"><div class="empty">Loading</div></main>
+
+<dialog id="add">
+  <h3 id="addTitle">Add an instrument</h3>
+  <div class="body">
+    <button onclick="scan()">Scan for instruments</button>
+    <span class="working" id="working"></span>
+    <div class="found" id="found"></div>
+
+    <label for="newName">Name</label>
+    <input class="wide" id="newName" placeholder="lockin">
+
+    <label for="newDriver">Driver</label>
+    <select class="wide" id="newDriver"></select>
+
+    <label for="newConn">Connection</label>
+    <input class="wide" id="newConn"
+           placeholder="gpib_address=8   or   resource_name=GPIB0::8::INSTR">
+
+    <div id="describe" hidden>
+      <label>Settings
+        <span class="hint">The commands this instrument answers. Put {} in the
+        write command where the value goes. Leave write empty for something
+        read only.</span></label>
+      <table id="rows">
+        <thead><tr>
+          <th>name</th><th>read with</th><th>write with</th>
+          <th>unit</th><th>type</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <button onclick="addRow()" style="margin-top:12px">Add a setting</button>
+    </div>
+  </div>
+  <div class="controls">
+    <span class="problem" id="problem"></span>
+    <button onclick="document.getElementById('add').close()">Cancel</button>
+    <button class="primary" id="confirm" onclick="addInstrument()">Add</button>
+  </div>
+</dialog>
+
+<script>
+const rack = document.getElementById("rack");
+let known = {};
+let editing = null;
+
+document.getElementById("host").textContent = location.host;
+
+// A bench machine often wants one theme regardless of what Windows is set to,
+// so the choice is remembered here and can also be forced with ?theme=dark.
+const THEMES = ["auto", "light", "dark"];
+
+function applyTheme(choice) {
+  if (choice === "auto") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = choice;
+  document.getElementById("theme").textContent = choice;
+  try { localStorage.setItem("labdrivers-theme", choice); } catch {}
+}
+
+function cycleTheme() {
+  const now = document.getElementById("theme").textContent;
+  applyTheme(THEMES[(THEMES.indexOf(now) + 1) % THEMES.length]);
+}
+
+applyTheme(
+  new URLSearchParams(location.search).get("theme")
+  || (() => { try { return localStorage.getItem("labdrivers-theme"); } catch { return null; } })()
+  || "auto"
+);
+
+async function api(path, method = "GET", body) {
+  const options = { method };
+  if (body !== undefined) {
+    options.headers = { "Content-Type": "application/json" };
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch("/api" + path, options);
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { detail: text }; }
+  if (!response.ok) throw new Error((data && data.detail) || response.statusText);
+  return data;
+}
+
+// Built through a template rather than a div. The HTML parser discards a <tr>
+// that is not inside a table, so a div would silently return nothing for the
+// rows of the settings editor.
+function element(html) {
+  const holder = document.createElement("template");
+  holder.innerHTML = html.trim();
+  return holder.content.firstElementChild;
+}
+
+function escape_(text) {
+  return String(text).replace(/[&<>"]/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// Readings are shown the way an instrument shows them: exponential once the
+// number stops being readable as a decimal.
+function show(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number") {
+    if (value !== 0 && (Math.abs(value) < 1e-3 || Math.abs(value) >= 1e6)) {
+      return value.toExponential(4);
+    }
+    return String(Number(value.toFixed(6)));
+  }
+  if (typeof value === "boolean") return value ? "on" : "off";
+  if (Array.isArray(value)) return value.map(show).join(", ");
+  return String(value);
+}
+
+// The rack
+
+// Which load is the current one. Two of them at once interleave their appends,
+// and the rack ends up holding every instrument twice.
+let loading = 0;
+
+async function load() {
+  const generation = ++loading;
+  const instruments = await api("/instruments");
+  if (generation !== loading) return;
+  rack.innerHTML = "";
+  known = {};
+  if (!instruments.length) {
+    rack.innerHTML = '<div class="empty">No instruments yet</div>';
+    tally();
+    return;
+  }
+  for (const summary of instruments) {
+    try {
+      const info = await api("/instruments/" + encodeURIComponent(summary.name));
+      if (generation !== loading) return;
+      known[summary.name] = info;
+      lastRead[summary.name] =
+        summary.age === null || summary.age === undefined
+          ? null
+          : Date.now() - summary.age * 1000;
+      rack.appendChild(drawUnit(info));
+      // Both drawn from what the server already knows. Opening the page must
+      // not put a burst of traffic on a bus a measurement may be using.
+      if (info.values) showValues(summary.name, info.values);
+      showUsers(summary.name, summary.users);
+    } catch (error) {
+      if (generation !== loading) return;
+      rack.appendChild(element(
+        `<div class="unit" data-name="${escape_(summary.name)}">
+           <div class="bezel"><span class="name">${escape_(summary.name)}</span></div>
+           <div class="fault">${escape_(error.message)}</div>
+         </div>`));
+    }
+  }
+  tally();
+}
+
+// How many are up, before any single panel is read.
+function tally() {
+  const lamps = [...rack.querySelectorAll(".lamp")];
+  const up = lamps.filter(lamp => lamp.classList.contains("connected")).length;
+  document.getElementById("tally").innerHTML = lamps.length
+    ? `<span class="up">connected <b>${up}</b></span>
+       <span class="${up < lamps.length ? "down" : ""}">of <b>${lamps.length}</b></span>`
+    : "";
+}
+
+function lineFor(setting) {
+  return `
+    <div class="line" title="${escape_(setting.help || "")}">
+      <span class="label">${escape_(setting.label)}</span>
+      <span class="right">
+        <span class="value" data-value="${escape_(setting.name)}">----</span>
+        ${setting.writable
+          ? `<input data-set="${escape_(setting.name)}" placeholder="set"
+                    aria-label="set ${escape_(setting.label)}">` : ""}
+        <span class="unit-label">${escape_(setting.unit || "")}</span>
+      </span>
+    </div>`;
+}
+
+// The panel shows what the instrument is telling you. What you tell it is a
+// job for a driver in a notebook, so the settings, the front-panel keys and
+// the console are all one click away rather than filling the page.
+function drawUnit(info) {
+  const name = info.name;
+  const wiring = Object.entries(info.connection || {})
+    .map(([key, value]) => `${key}=${value}`).join("  ");
+
+  const readings = info.settings.filter(s => !s.writable);
+  const controls = info.settings.filter(s => s.writable);
+  const actions = info.actions || [];
+
+  const unit = element(`
+    <div class="unit" data-name="${escape_(name)}">
+      <div class="bezel">
+        <span class="name">${escape_(name)}</span>
+        <span class="wiring">${escape_(info.driver)}${wiring ? "  " + escape_(wiring) : ""}</span>
+        <span class="age" data-age></span>
+        <span class="lamp ${info.status}">${info.status}</span>
+      </div>
+      <div class="readouts">${readings.map(lineFor).join("") ||
+        '<div class="line"><span class="label">nothing to read</span></div>'}</div>
+      <div class="users" data-users></div>
+      ${info.error ? `<div class="fault">${escape_(info.error)}</div>` : ""}
+      <div class="controls">
+        <button class="strip" data-read>Read</button>
+        <button class="strip" data-reconnect>Reconnect</button>
+        <button class="strip" data-remove>Remove</button>
+      </div>
+      ${actions.length ? `<details data-drawer="actions">
+        <summary>keys <b>${actions.length}</b></summary>
+        <div class="keys">${actions.map(a =>
+          `<button class="strip" data-action="${escape_(a.name)}" title="${
+            escape_(a.help || a.label)}">${escape_(a.label)}</button>`).join("")}</div>
+        <div class="echo" data-result></div>
+      </details>` : ""}
+      ${controls.length ? `<details data-drawer="settings">
+        <summary>settings <b>${controls.length}</b></summary>
+        <div class="readouts">${controls.map(lineFor).join("")}</div>
+      </details>` : ""}
+      <details data-drawer="console">
+        <summary>console</summary>
+        <div class="console">
+          <input data-command placeholder="*IDN?" aria-label="command">
+          <button class="strip" data-send title="Send with no reply expected">Send</button>
+          <button class="strip" data-ask title="Send and read the reply">Query</button>
+        </div>
+        <div class="echo" data-echo></div>
+      </details>
+    </div>`);
+
+  unit.querySelectorAll("[data-action]").forEach(key => {
+    key.onclick = () => runAction(name, key.dataset.action, key.textContent);
+  });
+  unit.querySelector("[data-read]").onclick = () => readValues(name);
+  unit.querySelector("[data-reconnect]").onclick = () => reconnect(name);
+  unit.querySelector("[data-remove]").onclick = () => remove(name);
+  unit.querySelector("[data-send]").onclick = () => sendCommand(name, false);
+  unit.querySelector("[data-ask]").onclick = () => sendCommand(name, true);
+  unit.querySelector("[data-command]").onkeydown = event => {
+    // Enter reads a reply. Whether a command answers cannot be told from its
+    // text, since the Oxford line protocol answers READ: with no question mark
+    // in it. A command that says nothing times out and reports it, which is
+    // visible and costs one command. A reply left sitting in a shared socket
+    // is invisible and hands every later read the answer to an earlier
+    // question, for every client, until the connection is opened again. Send
+    // is the button for a command that returns nothing.
+    if (event.key === "Enter") sendCommand(name, true);
+  };
+  // Enter commits. Leaving a box alone sends nothing, so a half-typed number
+  // never reaches an instrument.
+  unit.querySelectorAll("[data-set]").forEach(input => {
+    input.onkeydown = event => {
+      if (event.key === "Enter") setValue(name, input.dataset.set, input.value, input);
+    };
+  });
+
+  // A drawer someone opened stays open, so a panel they use as a control
+  // surface keeps looking like one.
+  unit.querySelectorAll("details").forEach(drawer => {
+    const key = `labdrivers-${name}-${drawer.dataset.drawer}`;
+    try { drawer.open = localStorage.getItem(key) === "open"; } catch {}
+    drawer.ontoggle = () => {
+      try { localStorage.setItem(key, drawer.open ? "open" : "shut"); } catch {}
+    };
+  });
+
+  markUsable(unit, info.status);
+
+  if (info.described) {
+    const edit = element(
+      '<button class="strip" title="Change the commands this instrument answers">Commands</button>');
+    edit.onclick = () => openAdd(info);
+    unit.querySelector(".controls").appendChild(edit);
+  }
+  return unit;
+}
+
+// Nothing that can only fail should look pressable. Typing a trigger level into
+// a scope that is not answering sends a request whose failure then overwrites
+// the message that said what was actually wrong.
+function markUsable(unit, status) {
+  const usable = status === "connected";
+  unit
+    .querySelectorAll("[data-set],[data-command],[data-send],[data-ask]")
+    .forEach(control => { control.disabled = !usable; });
+  unit.querySelector("[data-reconnect]").classList.toggle("primary", !usable);
+}
+
+function unitOf(name) {
+  return rack.querySelector(`[data-name="${CSS.escape(name)}"]`);
+}
+
+function showUsers(name, users) {
+  const cell = unitOf(name)?.querySelector("[data-users]");
+  if (!cell) return;
+  cell.innerHTML = (users && users.length)
+    ? "in use by " + users.map(who => `<b>${escape_(who)}</b>`).join(", ")
+    : "";
+}
+
+function setStatus(name, status, message) {
+  const unit = unitOf(name);
+  if (!unit) return;
+  const lamp = unit.querySelector(".lamp");
+  if (lamp) {
+    lamp.className = "lamp " + status;
+    lamp.textContent = status;
+  }
+  markUsable(unit, status);
+
+  let fault = unit.querySelector(".fault");
+  if (message) {
+    if (!fault) {
+      fault = element('<div class="fault"></div>');
+      unit.querySelector(".controls").before(fault);
+    }
+    fault.textContent = message;
+  } else if (fault) {
+    fault.remove();
+  }
+  tally();
+}
+
+// Talking to instruments
+
+function showValues(name, values) {
+  const unit = unitOf(name);
+  if (!unit) return;
+  for (const [setting, result] of Object.entries(values)) {
+    const cell = unit.querySelector(`[data-value="${CSS.escape(setting)}"]`);
+    if (!cell) continue;
+    cell.classList.toggle("faulted", Boolean(result.error));
+    const reading = show(result.value);
+    cell.textContent = result.error ? "fault" : reading;
+    // The cell is narrow, so whatever did not fit is still readable here.
+    cell.title = result.error || reading;
+  }
+}
+
+// The only thing on this page that talks to an instrument, and only when
+// somebody presses Read. Nothing here polls: the server is shared, and a
+// reading taken on a timer can land between the two commands of a measurement
+// running on another machine.
+async function readValues(name) {
+  try {
+    showValues(name, await api("/instruments/" + encodeURIComponent(name) + "/values"));
+    lastRead[name] = Date.now();
+    showAges();
+    setStatus(name, "connected", "");
+  } catch (error) {
+    setStatus(name, "error", error.message);
+  }
+}
+
+async function setValue(name, setting, value, input) {
+  if (value === "") return;
+  try {
+    const answer = await api("/instruments/" + encodeURIComponent(name) + "/set",
+                             "POST", { setting, value });
+    input.value = "";
+    const cell = unitOf(name).querySelector(`[data-value="${CSS.escape(setting)}"]`);
+    if (cell && answer.value !== null) {
+      cell.classList.remove("faulted");
+      cell.textContent = show(answer.value);
+    }
+    setStatus(name, "connected", "");
+  } catch (error) {
+    // The driver's own sentence says what the instrument accepts, so it is
+    // shown exactly as written rather than replaced with something vaguer.
+    setStatus(name, "connected", error.message);
+  }
+}
+
+async function reconnect(name) {
+  setStatus(name, "disconnected", "");
+  try {
+    await api("/instruments/" + encodeURIComponent(name) + "/reconnect", "POST");
+    setStatus(name, "connected", "");
+    readValues(name);
+  } catch (error) {
+    setStatus(name, "error", error.message);
+  }
+}
+
+async function remove(name) {
+  if (!confirm(
+      `Remove ${name}?\n\nThis closes the connection and leaves the instrument ` +
+      `exactly as it is. Nothing is reset and no output is switched off.`)) return;
+  // A refused delete has to say so, or whoever confirmed the dialog reasonably
+  // believes the instrument is gone.
+  try {
+    await api("/instruments/" + encodeURIComponent(name), "DELETE");
+    load();
+  } catch (error) {
+    setStatus(name, "error", error.message);
+  }
+}
+
+function readAll() {
+  Object.keys(known).forEach(readValues);
+}
+
+function describeAge(seconds) {
+  if (seconds === null || seconds === undefined) return "never read";
+  if (seconds < 60) return Math.round(seconds) + "s ago";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m ago";
+  return Math.round(seconds / 3600) + "h ago";
+}
+
+// Ticked from the last time the page heard a reading, so the number ages even
+// while nothing is polling. A stale panel that still says CONNECTED is the
+// failure mode this exists to prevent.
+const lastRead = {};
+
+function showAges() {
+  for (const [name, when] of Object.entries(lastRead)) {
+    const cell = unitOf(name)?.querySelector("[data-age]");
+    if (!cell) continue;
+    const seconds = when === null ? null : (Date.now() - when) / 1000;
+    cell.textContent = describeAge(seconds);
+    cell.classList.toggle("stale", seconds !== null && seconds > 60);
+    cell.classList.toggle("old", seconds === null || seconds > 300);
+  }
+}
+
+// One cheap request that touches no instrument, so a lamp that has gone red
+// since the page loaded turns red here too without anybody watching.
+async function refreshStatus() {
+  try {
+    const summaries = await api("/instruments");
+    const drawn = [...rack.querySelectorAll(".unit")].map(u => u.dataset.name);
+    if (summaries.map(s => s.name).join("\u0000") !== drawn.join("\u0000")) {
+      // Somebody else has added or removed one. The rack is out of date rather
+      // than the lamps on it, and a panel left behind for an instrument that
+      // is gone goes on showing it connected.
+      await load();
+      return;
+    }
+    for (const summary of summaries) {
+      const unit = unitOf(summary.name);
+      if (!unit) continue;
+      if (summary.age !== null && summary.age !== undefined) {
+        lastRead[summary.name] = Date.now() - summary.age * 1000;
+      }
+      showUsers(summary.name, summary.users);
+      const lamp = unit.querySelector(".lamp");
+      if (lamp && !lamp.classList.contains(summary.status)) {
+        setStatus(summary.name, summary.status, summary.error || "");
+      }
+    }
+    showAges();
+    // Rebuilt every time, because the rail may still be carrying the sentence
+    // the catch below wrote when the server was last unreachable.
+    tally();
+  } catch {
+    // The server itself is unreachable. Every panel is now suspect, so the
+    // rail says so rather than each panel pretending on its own.
+    document.getElementById("tally").innerHTML =
+      '<span class="down">server <b>unreachable</b></span>';
+  }
+}
+
+async function runAction(name, action, label) {
+  // Asked first. These are the instrument's own keys, so one of them may zero
+  // an output or shut a supply down, and the panel is shared with whoever else
+  // is on the bus.
+  if (!confirm(`Run ${label.trim()} on ${name}?`)) return;
+  const unit = unitOf(name);
+  const echo = unit.querySelector("[data-result]");
+  echo.textContent = "...";
+  try {
+    const answer = await api(
+      "/instruments/" + encodeURIComponent(name) + "/action", "POST", { action });
+    echo.textContent =
+      answer.result === null || answer.result === undefined
+        ? `${label.trim()} done`
+        : String(answer.result);
+  } catch (error) {
+    echo.textContent = error.message;
+  }
+}
+
+async function sendCommand(name, expectReply) {
+  const unit = unitOf(name);
+  const input = unit.querySelector("[data-command]");
+  const echo = unit.querySelector("[data-echo]");
+  const command = input.value.trim();
+  if (!command) return;
+  echo.textContent = "...";
+  let answer;
+  try {
+    answer = await api("/instruments/" + encodeURIComponent(name) + "/io",
+                       "POST", { kind: expectReply ? "query" : "write", command });
+  } catch (error) {
+    echo.textContent = error.message;
+    echo.style.color = "var(--bad)";
+    return;
+  }
+  echo.textContent = answer.error
+    ? answer.error
+    : (expectReply ? command + "  →  " + answer.reply : command + "  sent");
+  echo.style.color = answer.error ? "var(--bad)" : "var(--dim)";
+}
+
+// Adding, and describing an instrument the package has no driver for
+
+const TYPES = ["float", "integer", "boolean", "string"];
+
+// Settings as the server last described them, keyed by name. The editor only
+// shows five columns, so everything else a setting carries is kept here and
+// put back on save. Without this, opening the dialog and pressing save strips
+// a setting's minimum and maximum, and the instrument loses its bounds.
+let described = {};
+
+function addRow(setting = {}) {
+  if (setting.name) described[setting.name] = setting;
+  const row = element(`<tr>
+    <td><input data-key="name" placeholder="voltage"></td>
+    <td><input data-key="query" placeholder="VOLT?"></td>
+    <td><input data-key="write" placeholder="VOLT {}"></td>
+    <td><input data-key="unit" placeholder="V"></td>
+    <td class="choice"><select data-key="type">
+      ${TYPES.map(type => `<option>${type}</option>`).join("")}</select></td>
+    <td><button class="strip" title="Remove this setting">&times;</button></td>
+  </tr>`);
+  row.querySelectorAll("[data-key]").forEach(field => {
+    const given = setting[field.dataset.key];
+    if (given !== undefined) field.value = given;
+  });
+  row.querySelector("button").onclick = () => row.remove();
+  document.querySelector("#rows tbody").appendChild(row);
+}
+
+function collectSettings() {
+  const settings = [];
+  for (const row of document.querySelectorAll("#rows tbody tr")) {
+    const edited = {};
+    row.querySelectorAll("[data-key]").forEach(field => {
+      if (field.value.trim()) edited[field.dataset.key] = field.value.trim();
+    });
+    if (!edited.name) continue;
+    // Start from what the setting already had, so a range, a help string or a
+    // list of choices survives an edit that never showed them.
+    const kept = { ...(described[edited.name] || {}) };
+    for (const key of ["query", "write", "unit"]) delete kept[key];
+    settings.push({ ...kept, ...edited });
+  }
+  return settings;
+}
+
+function toggleDescribe() {
+  const generic = document.getElementById("newDriver").value === "Generic";
+  document.getElementById("describe").hidden = !generic;
+  if (generic && !document.querySelector("#rows tbody tr")) addRow();
+}
+
+// Called with no argument to add an instrument, or with one to change what an
+// already described instrument offers.
+async function openAdd(existing = null) {
+  const dialog = document.getElementById("add");
+  editing = existing;
+  document.getElementById("problem").textContent = "";
+  document.getElementById("found").innerHTML = "";
+  document.getElementById("working").textContent = "";
+  document.querySelector("#rows tbody").innerHTML = "";
+  described = {};
+
+  const select = document.getElementById("newDriver");
+  select.innerHTML = "";
+  for (const driver of await api("/drivers")) {
+    const option = document.createElement("option");
+    option.value = driver.name;
+    option.textContent = driver.name + (driver.summary ? "  ·  " + driver.summary : "");
+    select.appendChild(option);
+  }
+  select.onchange = toggleDescribe;
+
+  document.getElementById("addTitle").textContent =
+    existing ? `Settings for ${existing.name}` : "Add an instrument";
+  document.getElementById("confirm").textContent = existing ? "Save" : "Add";
+  document.getElementById("newName").value = existing ? existing.name : "";
+  document.getElementById("newName").disabled = Boolean(existing);
+  document.getElementById("newConn").disabled = Boolean(existing);
+  select.disabled = Boolean(existing);
+
+  if (existing) {
+    select.value = "Generic";
+    document.getElementById("newConn").value =
+      Object.entries(existing.connection || {}).map(([k, v]) => `${k}=${v}`).join(" ");
+    (existing.description?.settings || []).forEach(addRow);
+  } else {
+    document.getElementById("newConn").value = "";
+  }
+  toggleDescribe();
+  dialog.showModal();
+}
+
+async function scan() {
+  const working = document.getElementById("working");
+  working.textContent = "scanning";
+  try {
+    const found = await api("/scan");
+    working.textContent = "";
+    document.getElementById("found").innerHTML = found.length ? `
+      <table><thead><tr><th>resource</th><th>answers *IDN? with</th><th></th></tr></thead>
+      <tbody>${found.map((item, index) => `<tr>
+        <td>${escape_(item.resource)}</td>
+        <td>${escape_(item.identity || (item.in_use ? "in use here" : "no reply"))}</td>
+        <td class="choice">${item.in_use ? ""
+          : `<button class="strip" onclick="pick(${index})">use</button>`}</td>
+      </tr>`).join("")}</tbody></table>`
+      : '<p class="hint">VISA found nothing on this machine.</p>';
+    window.found = found;
+  } catch (error) {
+    working.textContent = "";
+    document.getElementById("problem").textContent = error.message;
+  }
+}
+
+function pick(index) {
+  const item = window.found[index];
+  document.getElementById("newConn").value = "resource_name=" + item.resource;
+  if (item.suggested.length) document.getElementById("newDriver").value = item.suggested[0];
+  toggleDescribe();
+}
+
+async function addInstrument() {
+  const problem = document.getElementById("problem");
+  const name = document.getElementById("newName").value.trim();
+  const driver = document.getElementById("newDriver").value;
+  if (!name) { problem.textContent = "Give it a name."; return; }
+
+  // "gpib_address=8, timeout=5" becomes the driver's keyword arguments.
+  const connection = {};
+  for (const piece of document.getElementById("newConn").value.split(/[,\s]+/)) {
+    if (!piece.includes("=")) continue;
+    const [key, ...rest] = piece.split("=");
+    const text = rest.join("=");
+    connection[key.trim()] = /^-?\d+(\.\d+)?$/.test(text) ? Number(text) : text;
+  }
+
+  try {
+    const settings = driver === "Generic" ? collectSettings() : [];
+    if (editing) {
+      await api("/instruments/" + encodeURIComponent(editing.name) + "/describe",
+                "POST", { settings, actions: editing.description?.actions || [] });
+    } else {
+      await api("/instruments", "POST", { name, driver, connection, settings });
+    }
+    document.getElementById("add").close();
+    document.getElementById("newName").value = "";
+    load();
+  } catch (failure) {
+    problem.textContent = failure.message;
+  }
+}
+
+load();
+setInterval(showAges, 5000);
+
+// How often to re-check comes from the server, so it is set once in the
+// configuration file rather than by editing this page.
+(async () => {
+  let seconds = 20;
+  try {
+    const configured = (await api("/settings")).refresh;
+    if (configured !== undefined && configured !== null) seconds = Number(configured);
+  } catch {}
+  if (seconds > 0) setInterval(refreshStatus, seconds * 1000);
+})();
+</script>
+</body>
+</html>

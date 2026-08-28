@@ -46,6 +46,8 @@ class MercuryItcHeliox(MercuryItc):
                                      kelvin.
     """
 
+    maximum_sorb_temperature = None
+
     def __init__(
         self,
         *args,

@@ -12,8 +12,9 @@ from .errors import (
     InstrumentTimeoutError,
     LabdriversError,
     RangeError,
+    UnknownSetting,
 )
-from .instrument import Instrument, ScpiInstrument
+from .instrument import Instrument, ScpiInstrument, Settings
 from .transport import (
     RecordingTransport,
     SocketTransport,
@@ -37,8 +38,10 @@ __all__ = [
     "InstrumentTimeoutError",
     "LabdriversError",
     "RangeError",
+    "UnknownSetting",
     "RecordingTransport",
     "ScpiInstrument",
+    "Settings",
     "SocketTransport",
     "Transport",
     "VisaTransport",

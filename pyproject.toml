@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "Python drivers for laboratory instruments"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 keywords = [
     "instrument",
     "scpi",
@@ -27,6 +27,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -36,14 +37,20 @@ classifiers = [
 
 # pyvisa reaches everything on GPIB, USB, serial or TCPIP, which is most of
 # the instruments here. The Oxford cryogenics controllers use a raw socket and
-# need nothing extra. The NI DAQ and Quantum Design drivers each need a
-# vendor library, so those are extras.
-dependencies = ["pyvisa>=1.11"]
+# need nothing extra. nidaqmx and pythonnet are the vendor bindings the NI DAQ
+# and Quantum Design drivers load, and both install anywhere: each fails only
+# at import, and only if the vendor runtime underneath it is absent.
+dependencies = ["pyvisa>=1.11", "nidaqmx>=0.6", "pythonnet>=3.0"]
 
+# The only extra. Everything else a driver needs is a base dependency, so
+# there is one thing to install and one decision to make.
 [project.optional-dependencies]
-ni = ["nidaqmx>=0.6"]
-quantumdesign = ["pythonnet>=3.0"]
-dev = ["pytest>=7", "black>=23", "pyflakes>=3"]
+server = ["fastapi>=0.100", "uvicorn>=0.23"]
+
+# Installed as labdrivers-server, which holds the instruments open and
+# serves the page for driving them.
+[project.scripts]
+labdrivers-server = "labdrivers.server.app:main"
 
 [tool.setuptools.packages.find]
 include = ["labdrivers*"]
@@ -54,6 +61,7 @@ include = ["labdrivers*"]
 [tool.setuptools.package-data]
 "labdrivers.quantumdesign" = ["*.dll"]
 "labdrivers.funky_rotator" = ["*.dll"]
+"labdrivers.server" = ["static/*"]
 
 [tool.black]
 line-length = 88

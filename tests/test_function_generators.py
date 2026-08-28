@@ -23,7 +23,13 @@ INTO_HIGH_Z = "9.9E37"
 
 
 def build_keysight(responses=None, identity=KEYSIGHT_2CH, **kwargs):
-    replies = {"*IDN?": identity, "OUTP1:LOAD?": INTO_50, "OUTP2:LOAD?": INTO_50}
+    replies = {
+        "*IDN?": identity,
+        "OUTP1:LOAD?": INTO_50,
+        "OUTP2:LOAD?": INTO_50,
+        "SOUR1:VOLT:UNIT?": "VPP",
+        "SOUR2:VOLT:UNIT?": "VPP",
+    }
     replies.update(responses or {})
     transport = RecordingTransport(replies)
     instrument = Keysight33500(transport=transport, **kwargs)
@@ -36,6 +42,8 @@ def build_rigol(responses=None, **kwargs):
         "*IDN?": RIGOL_IDENTITY,
         ":OUTP1:IMP?": INTO_50,
         ":OUTP2:IMP?": INTO_50,
+        ":SOUR1:VOLT:UNIT?": "VPP",
+        ":SOUR2:VOLT:UNIT?": "VPP",
     }
     replies.update(responses or {})
     transport = RecordingTransport(replies)
@@ -379,3 +387,18 @@ def test_safe_shutdown_turns_everything_off(keysight):
     assert transport.writes[0] == "OUTP1 0"
     assert "SOUR1:BURS:STAT 0" in transport.writes
     assert "SOUR1:SWE:STAT 0" in transport.writes
+
+
+def test_amplitude_is_not_bounded_in_volts_when_the_unit_is_not_volts():
+    # The limits are peak-to-peak volts. Applied while the generator is set to
+    # dBm they would refuse every ordinary level, because -10 dBm is a
+    # perfectly normal output and reads as a negative voltage.
+    generator, transport = build_keysight({"SOUR1:VOLT:UNIT?": "DBM"})
+    generator.amplitude = -10
+    assert transport.last_command == "SOUR1:VOLT -10"
+
+
+def test_the_rigol_amplitude_is_not_bounded_in_volts_either():
+    generator, transport = build_rigol({":SOUR1:VOLT:UNIT?": "DBM"})
+    generator.amplitude = -10
+    assert transport.last_command == ":SOUR1:VOLT -10"
